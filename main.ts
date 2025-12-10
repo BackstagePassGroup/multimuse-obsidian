@@ -1274,17 +1274,7 @@ export default class MultimuseObsidian extends Plugin {
 
 	showSuggester(items: string[], values: any[], title?: string): Promise<number | null> {
 		return new Promise((resolve) => {
-			// Try QuickAdd API first
-			const quickadd = (this.app as any).plugins.plugins.quickadd;
-			if (quickadd?.api?.suggester) {
-				quickadd.api.suggester(items, values).then((selected: any) => {
-					const index = values.indexOf(selected);
-					resolve(index >= 0 ? index : null);
-				}).catch(() => resolve(null));
-				return;
-			}
-
-			// Fallback: create a modal with buttons
+			// Create a modal with buttons
 			const modal = new (class extends Modal {
 				selectedIndex: number | null = null;
 				items: string[];
@@ -1296,12 +1286,38 @@ export default class MultimuseObsidian extends Plugin {
 					this.items = items;
 					this.values = values;
 					this.titleText = titleText || 'Select an option';
+					// Set title in constructor to ensure it's set before modal opens
+					this.titleEl.textContent = this.titleText;
 				}
 
 				onOpen() {
 					const { contentEl } = this;
 					contentEl.empty();
-					contentEl.createEl('h2', { text: this.titleText });
+					
+					// Ensure title is set (in case it was reset)
+					this.titleEl.textContent = this.titleText;
+					
+					// If title contains context (e.g., "for muse X"), extract and display prominently
+					if (this.titleText.includes('for')) {
+						// Extract the muse name from the title
+						const match = this.titleText.match(/for (.+)$/);
+						if (match) {
+							const contextInfo = match[1];
+							const infoEl = contentEl.createEl('div', {
+								attr: { 
+									style: 'margin-bottom: 20px; padding: 10px; background: var(--background-modifier-border); border-radius: 4px;' 
+								}
+							});
+							infoEl.createEl('strong', { 
+								text: `Creating scene file for: ${contextInfo}`,
+								attr: { style: 'color: var(--text-normal); font-size: 1.1em;' }
+							});
+						}
+						const descEl = contentEl.createEl('p', {
+							text: 'Choose where to create the scene file:',
+							attr: { style: 'margin-top: 10px; margin-bottom: 15px; color: var(--text-muted);' }
+						});
+					}
 
 					this.items.forEach((item, index) => {
 						const button = contentEl.createEl('button', {
@@ -1327,14 +1343,7 @@ export default class MultimuseObsidian extends Plugin {
 
 	showInputPrompt(prompt: string, defaultValue?: string): Promise<string | null> {
 		return new Promise((resolve) => {
-			// Try QuickAdd API first
-			const quickadd = (this.app as any).plugins.plugins.quickadd;
-			if (quickadd?.api?.inputPrompt) {
-				quickadd.api.inputPrompt(prompt, defaultValue).then(resolve).catch(() => resolve(null));
-				return;
-			}
-
-			// Fallback: use Obsidian's built-in prompt
+			// Use Obsidian's built-in modal for input
 			const modal = new (class extends Modal {
 				inputEl: HTMLInputElement;
 				value: string | null = null;
