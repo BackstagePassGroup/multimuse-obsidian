@@ -1,0 +1,19 @@
+/* Styles for Discord Scene Tracker plugin */
+
+.discord-scene-tracker-settings {
+	padding: 20px;
+}
+
+.discord-scene-tracker-settings h2 {
+	margin-top: 0;
+}
+
+.discord-scene-tracker-settings .setting-item {
+	border-top: 1px solid var(--background-modifier-border);
+	padding: 18px 0;
+}
+
+.discord-scene-tracker-settings .setting-item:first-child {
+	border-top: none;
+}
+
