@@ -1,7 +1,7 @@
 {
 	"id": "multimuse-obsidian",
 	"name": "Multimuse Obsidian",
-	"version": "1.0.0",
+	"version": "1.3.0",
 	"minAppVersion": "1.0.0",
 	"description": "Roleplay sync tool for use with the MultiMuse bot in discord",
 	"author": "BackstagePass Group",

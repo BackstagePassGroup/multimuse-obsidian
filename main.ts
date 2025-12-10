@@ -10,6 +10,8 @@ interface MultimuseObsidianSettings {
 	enabled: boolean;
 	apiKey: string; // API key for authentication (Bearer token)
 	cachedUserId: string; // Cached user ID from API key (auto-populated)
+	trackRoleplay: boolean; // Whether to add Roleplay property from folder path
+	trackIsActive: boolean; // Whether to add Is Active? property (defaulting to true)
 }
 
 const DEFAULT_SETTINGS: MultimuseObsidianSettings = {
@@ -21,7 +23,9 @@ const DEFAULT_SETTINGS: MultimuseObsidianSettings = {
 	userIds: '', // Deprecated - auto-synced from API key
 	enabled: true,
 	apiKey: '',
-	cachedUserId: '' // Auto-populated from API key
+	cachedUserId: '', // Auto-populated from API key
+	trackRoleplay: true, // Default: extract Roleplay from folder path
+	trackIsActive: true // Default: add Is Active? property
 };
 
 interface MuseInfo {
@@ -36,6 +40,7 @@ export default class MultimuseObsidian extends Plugin {
 	settings: MultimuseObsidianSettings;
 	pollIntervalId: number | null = null;
 	museCache: Map<string, MuseInfo[]> = new Map(); // user_id (as string) -> muses
+	recentlyCreatedFiles: Set<string> = new Set(); // Track recently created files to skip immediate checking
 
 	async onload() {
 		await this.loadSettings();
@@ -405,6 +410,12 @@ export default class MultimuseObsidian extends Plugin {
 			// Process each scene file
 			for (const file of sceneFiles) {
 				try {
+					// Skip checking if this file was recently created by the plugin
+					if (this.recentlyCreatedFiles.has(file.path)) {
+						console.log(`[MultimuseObsidian] checkAllThreadsViaBotApi: Skipping recently created file: ${file.path}`);
+						continue;
+					}
+
 					const cache = this.app.metadataCache.getFileCache(file);
 					if (!cache || !cache.frontmatter) {
 						continue;
@@ -485,6 +496,12 @@ export default class MultimuseObsidian extends Plugin {
 
 	async querySceneState(file: TFile): Promise<boolean> {
 		/**Query the tracker API for a specific scene's state and update frontmatter.*/
+		// Skip checking if this file was recently created by the plugin
+		if (this.recentlyCreatedFiles.has(file.path)) {
+			console.log(`[MultimuseObsidian] querySceneState: Skipping check for recently created file: ${file.path}`);
+			return false;
+		}
+
 		const cache = this.app.metadataCache.getFileCache(file);
 		if (!cache || !cache.frontmatter) {
 			return false;
@@ -538,10 +555,19 @@ export default class MultimuseObsidian extends Plugin {
 			
 			// If scene is not tracked, don't update anything
 			if (!data.tracked || !data.state) {
+				console.log(`[MultimuseObsidian] Scene ${file.basename} is not tracked (tracked: ${data.tracked}, has state: ${!!data.state}) - skipping update`);
 				return false;
 			}
 
 			const state = data.state;
+			console.log(`[MultimuseObsidian] Scene ${file.basename} is tracked. State:`, JSON.stringify(state));
+			
+			// Only update if state.replied is explicitly defined (not undefined/null)
+			if (state.replied === undefined || state.replied === null) {
+				console.log(`[MultimuseObsidian] Scene ${file.basename} has undefined/null replied value - skipping update`);
+				return false;
+			}
+			
 			return await this.updateSceneFromState(file, cache, state);
 		} catch (error) {
 			console.error(`[MultimuseObsidian] Error querying scene state for ${file.path}:`, error);
@@ -553,11 +579,28 @@ export default class MultimuseObsidian extends Plugin {
 		/**Update scene frontmatter from API state data.*/
 		let updated = false;
 
+		// Only update if state.replied is explicitly defined (boolean or string 'true'/'false')
+		if (state.replied === undefined || state.replied === null) {
+			console.log(`[MultimuseObsidian] ${file.basename}: state.replied is undefined/null - skipping update`);
+			return false;
+		}
+
+		// Check if the state looks suspicious (e.g., bot couldn't access channel)
+		// If timestamp is null and your_last_post is null, it might indicate the bot couldn't read the channel
+		// In this case, don't update the Replied? field to avoid incorrect updates
+		if (state.timestamp === null && state.your_last_post === null && state.posted_since_count === 0) {
+			console.log(`[MultimuseObsidian] ${file.basename}: State appears invalid (timestamp and your_last_post are null) - likely bot can't access channel. Skipping update to prevent incorrect "Replied?" value.`);
+			return false;
+		}
+
 		// Update Replied? field - normalize boolean values for comparison
 		const currentRepliedRaw = cache.frontmatter['Replied?'];
 		// Handle both boolean and string values
 		const currentReplied = currentRepliedRaw === true || currentRepliedRaw === 'true' || currentRepliedRaw === 'True';
+		// Only treat as true if explicitly true or 'true' string
 		const shouldBeReplied = state.replied === true || state.replied === 'true'; // true = your turn, false = not your turn
+
+		console.log(`[MultimuseObsidian] ${file.basename}: Current Replied?=${currentReplied}, API replied=${state.replied}, shouldBeReplied=${shouldBeReplied}`);
 
 		if (currentReplied !== shouldBeReplied) {
 			console.log(`[MultimuseObsidian] ${file.basename}: Updated Replied? to ${shouldBeReplied}`);
@@ -588,6 +631,12 @@ export default class MultimuseObsidian extends Plugin {
 
 		// Only process if enabled and API key is set
 		if (!this.settings.apiKey || !this.settings.enabled) {
+			return;
+		}
+
+		// Skip checking if this file was recently created by the plugin
+		if (this.recentlyCreatedFiles.has(file.path)) {
+			console.log(`[MultimuseObsidian] Skipping check for recently created file: ${file.path}`);
 			return;
 		}
 
@@ -778,10 +827,13 @@ export default class MultimuseObsidian extends Plugin {
 
 		// 2) Select muse
 		const museOptions = muses.map(m => m.name);
-		const selectedMuseIndex = await this.showSuggester(museOptions, museOptions);
+		const selectedMuseIndex = await this.showSuggester(museOptions, museOptions, 'Select a muse');
 		if (selectedMuseIndex === null || selectedMuseIndex < 0) return;
 
 		const selectedMuse = muses[selectedMuseIndex];
+
+		// Small delay to ensure previous modal is fully closed
+		await new Promise(resolve => setTimeout(resolve, 100));
 
 		// 3) Get Discord thread/channel link
 		const threadUrl = await this.showInputPrompt('Enter Discord thread/channel URL');
@@ -793,8 +845,13 @@ export default class MultimuseObsidian extends Plugin {
 			return;
 		}
 
-		// 4) Get location (RP folder)
-		const location = await this.selectSceneLocation();
+		// Small delay before opening location modal
+		await new Promise(resolve => setTimeout(resolve, 100));
+
+		// 4) Get location (RP folder) - pass muse name for context
+		console.log(`[MultimuseObsidian] createNewScene: About to select location for muse "${selectedMuse.name}"`);
+		const location = await this.selectSceneLocation(`muse "${selectedMuse.name}"`);
+		console.log(`[MultimuseObsidian] createNewScene: Selected location: ${location || 'null (cancelled)'}`);
 		if (!location) return;
 
 		// 5) Get scene name
@@ -807,13 +864,26 @@ export default class MultimuseObsidian extends Plugin {
 
 		// 7) Create scene file
 		const filePath = `${location}/${sceneName}.md`;
-		const frontmatter = {
+		const frontmatter: Record<string, any> = {
 			'Link': threadUrl,
 			'Characters': [selectedMuse.name],
 			'Participants': participants,
 			'Replied?': false,
 			'Created': new Date().toISOString().split('T')[0],
 		};
+
+		// Add Roleplay property if enabled
+		if (this.settings.trackRoleplay) {
+			const roleplay = this.extractRoleplayFromPath(location);
+			if (roleplay) {
+				frontmatter['Roleplay'] = roleplay;
+			}
+		}
+
+		// Add Is Active? property if enabled
+		if (this.settings.trackIsActive) {
+			frontmatter['Is Active?'] = true;
+		}
 
 		const frontmatterLines = ['---'];
 		for (const [key, value] of Object.entries(frontmatter)) {
@@ -831,15 +901,35 @@ export default class MultimuseObsidian extends Plugin {
 
 		const content = frontmatterLines.join('\n');
 
-		// Ensure folder exists
-		const folderPath = location;
-		const folder = this.app.vault.getAbstractFileByPath(folderPath);
-		if (!folder) {
-			await this.app.vault.createFolder(folderPath);
+		// Ensure all folders in the path exist (create recursively)
+		const segs = location.split("/").filter(Boolean);
+		let currentPath = segs[0];
+		
+		// Ensure root folder exists
+		let abs = this.app.vault.getAbstractFileByPath(currentPath);
+		if (!abs) {
+			await this.app.vault.createFolder(currentPath);
+		}
+		
+		// Create nested folders
+		for (let i = 1; i < segs.length; i++) {
+			currentPath += "/" + segs[i];
+			const folder = this.app.vault.getAbstractFileByPath(currentPath);
+			if (!folder) {
+				await this.app.vault.createFolder(currentPath);
+			}
 		}
 
 		// Create file
 		const createdFile = await this.app.vault.create(filePath, content);
+		
+		// Mark this file as recently created to skip immediate checking
+		this.recentlyCreatedFiles.add(filePath);
+		// Remove from the set after 60 seconds (enough time for the scene to be registered and settled with the API)
+		setTimeout(() => {
+			this.recentlyCreatedFiles.delete(filePath);
+			console.log(`[MultimuseObsidian] Removed ${filePath} from recently created files - will now be checked by polling`);
+		}, 60000);
 
 		// 8) Register with bot API and optionally create thread tracking
 		try {
@@ -1031,13 +1121,26 @@ export default class MultimuseObsidian extends Plugin {
 				const sceneName = thread.thread_name || `${museName} - Thread ${threadId}`;
 				const filePath = `${location}/${sceneName}.md`;
 
-				const frontmatter = {
+				const frontmatter: Record<string, any> = {
 					'Link': threadUrl,
 					'Characters': [museName],
 					'Participants': participants,
 					'Replied?': false,
 					'Created': new Date().toISOString().split('T')[0],
 				};
+
+				// Add Roleplay property if enabled
+				if (this.settings.trackRoleplay) {
+					const roleplay = this.extractRoleplayFromPath(location);
+					if (roleplay) {
+						frontmatter['Roleplay'] = roleplay;
+					}
+				}
+
+				// Add Is Active? property if enabled
+				if (this.settings.trackIsActive) {
+					frontmatter['Is Active?'] = true;
+				}
 
 				const frontmatterLines = ['---'];
 				for (const [key, value] of Object.entries(frontmatter)) {
@@ -1055,14 +1158,34 @@ export default class MultimuseObsidian extends Plugin {
 
 				const content = frontmatterLines.join('\n');
 
-				// Ensure folder exists
-				const folder = this.app.vault.getAbstractFileByPath(location);
-				if (!folder) {
-					await this.app.vault.createFolder(location);
+				// Ensure all folders in the path exist (create recursively)
+				const segs = location.split("/").filter(Boolean);
+				let currentPath = segs[0];
+				
+				// Ensure root folder exists
+				let abs = this.app.vault.getAbstractFileByPath(currentPath);
+				if (!abs) {
+					await this.app.vault.createFolder(currentPath);
+				}
+				
+				// Create nested folders
+				for (let i = 1; i < segs.length; i++) {
+					currentPath += "/" + segs[i];
+					const folder = this.app.vault.getAbstractFileByPath(currentPath);
+					if (!folder) {
+						await this.app.vault.createFolder(currentPath);
+					}
 				}
 
 				// Create file
 				const file = await this.app.vault.create(filePath, content);
+				
+				// Mark this file as recently created to skip immediate checking
+				this.recentlyCreatedFiles.add(filePath);
+				// Remove from the set after 30 seconds (enough time for the scene to be registered with the API)
+				setTimeout(() => {
+					this.recentlyCreatedFiles.delete(filePath);
+				}, 30000);
 
 				// Register with bot
 				// Use primary user ID for scene registration
@@ -1219,6 +1342,26 @@ export default class MultimuseObsidian extends Plugin {
 		return null;
 	}
 
+	/**
+	 * Extract the Roleplay property from a folder path.
+	 * Roleplay is the first folder under the scenes folder.
+	 * @param folderPath Full folder path (e.g., "RP Scenes/For The Greeks/Twin Flames")
+	 * @returns Roleplay name (e.g., "For The Greeks") or null if path is invalid
+	 */
+	extractRoleplayFromPath(folderPath: string): string | null {
+		const RP_ROOT = this.settings.scenesFolder;
+		if (!folderPath.startsWith(RP_ROOT + "/")) {
+			return null;
+		}
+		
+		// Remove RP_ROOT prefix and split
+		const relPath = folderPath.slice(RP_ROOT.length + 1);
+		const parts = relPath.split("/").filter(p => p.length > 0);
+		
+		// First part is the Roleplay
+		return parts.length > 0 ? parts[0] : null;
+	}
+
 	async selectSceneLocation(context?: string): Promise<string | null> {
 		/**Select or create scene location folder.
 		 * @param context Optional context string (e.g., muse name) to display in the prompt
@@ -1244,6 +1387,7 @@ export default class MultimuseObsidian extends Plugin {
 			.filter(Boolean)
 			.sort((a, b) => a.localeCompare(b, "en", { sensitivity: "base" }));
 
+		// Always add the option to create a new folder path
 		options.push("+ New folder path…");
 
 		// Build title with context if provided
@@ -1251,8 +1395,12 @@ export default class MultimuseObsidian extends Plugin {
 			? `Select location for ${context}`
 			: 'Select scene location';
 		
+		console.log(`[MultimuseObsidian] selectSceneLocation: Showing ${options.length} options with title: ${suggesterTitle}`);
 		const choiceIndex = await this.showSuggester(options, options, suggesterTitle);
-		if (choiceIndex === null) return null;
+		if (choiceIndex === null) {
+			console.log(`[MultimuseObsidian] selectSceneLocation: User cancelled or no selection`);
+			return null;
+		}
 
 		const choice = options[choiceIndex];
 		if (!choice) return null;
@@ -1337,7 +1485,11 @@ export default class MultimuseObsidian extends Plugin {
 				}
 			})(this.app, items, values, title);
 
-			modal.open();
+			console.log(`[MultimuseObsidian] showSuggester: Opening modal with ${items.length} items, title: ${title || 'Select an option'}`);
+			// Use requestAnimationFrame to ensure modal opens after any previous modals are fully closed
+			requestAnimationFrame(() => {
+				modal.open();
+			});
 		});
 	}
 
@@ -1587,6 +1739,29 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.basePath)
 				.onChange(async (value) => {
 					this.plugin.settings.basePath = value;
+					await this.plugin.saveSettings();
+				}));
+
+		// Scene Properties Tracking
+		containerEl.createEl('h3', { text: 'Scene Properties' });
+
+		new Setting(containerEl)
+			.setName('Track Roleplay Property')
+			.setDesc(`Automatically add "Roleplay" property to scene files based on the selected folder (e.g., "For The Greeks" from "${this.plugin.settings.scenesFolder}/For The Greeks/Twin Flames")`)
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.trackRoleplay)
+				.onChange(async (value) => {
+					this.plugin.settings.trackRoleplay = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Track Is Active? Property')
+			.setDesc('Automatically add "Is Active?" property to new scene files (defaults to true)')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.trackIsActive)
+				.onChange(async (value) => {
+					this.plugin.settings.trackIsActive = value;
 					await this.plugin.saveSettings();
 				}));
 

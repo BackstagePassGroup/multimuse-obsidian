@@ -1,6 +1,6 @@
 {
 	"name": "multimuse-obsidian",
-	"version": "1.0.0",
+	"version": "1.3.0",
 	"description": "Obsidian plugin for MultiMuse bot integration - track Discord threads and send messages as muses",
 	"main": "main.js",
 	"scripts": {
