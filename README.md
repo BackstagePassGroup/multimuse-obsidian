@@ -1,38 +1,45 @@
-# Multimuse Obsidian - Obsidian Plugin
+# Multimuse Obsidian
 
-Obsidian plugin for MultiMuse bot integration - track Discord threads and send messages as muses directly from Obsidian.
+An Obsidian plugin for seamless integration with the MultiMuse Discord bot. Track Discord roleplay threads, send messages as muses directly from Obsidian, and automatically sync scene states.
 
 ## Features
 
-- ✅ Automatically tracks Discord threads linked in your scene files
-- ✅ Updates `Replied?` and `Participants` fields in frontmatter
+- ✅ **Automatic Thread Tracking**: Automatically tracks Discord threads linked in your scene files
 - ✅ **Send as Muse**: Right-click selected text to post as a muse to Discord threads
-- ✅ Auto-detects user ID from API key (no manual configuration needed)
-- ✅ Configurable poll interval (5-60 minutes)
-- ✅ Works entirely within Obsidian
-- ✅ Supports multiple muses and character selection
+- ✅ **Auto-Detected User ID**: Automatically detects your Discord user ID from your API key (no manual configuration needed)
+- ✅ **Scene Creation**: Create new scene files with muse selection, folder organization, and automatic property tracking
+- ✅ **Sync from Tracker**: Import tracked threads from the bot and create scene files
+- ✅ **Property Tracking**: Automatically adds "Roleplay" and "Is Active?" properties based on folder structure
+- ✅ **Configurable Polling**: Automatically checks Discord threads for new replies (5-60 minute intervals)
+- ✅ **Frontmatter Updates**: Automatically updates `Replied?` and `Participants` fields based on thread state
 
 ## Installation
 
 ### Manual Installation
 
-1. Copy the `multimuse-obsidian` folder to your Obsidian vault's `.obsidian/plugins/` directory
-2. Open Obsidian Settings → Community Plugins
-3. Enable "Multimuse Obsidian"
-4. Go to Settings → Multimuse Obsidian and configure your API key
+1. Download the latest release from the [Releases](https://github.com/yourusername/multimuse-obsidian/releases) page
+2. Extract the `multimuse-obsidian` folder to your Obsidian vault's `.obsidian/plugins/` directory
+3. Open Obsidian Settings → Community Plugins
+4. Enable "Multimuse Obsidian"
+5. Go to Settings → Multimuse Obsidian and configure your API key
 
 ### Development Installation
 
-1. Clone or copy this folder to `.obsidian/plugins/multimuse-obsidian`
-2. Install dependencies:
+1. Clone this repository:
    ```bash
+   git clone https://github.com/yourusername/multimuse-obsidian.git
+   ```
+2. Copy the repository to `.obsidian/plugins/multimuse-obsidian`
+3. Install dependencies:
+   ```bash
+   cd .obsidian/plugins/multimuse-obsidian
    npm install
    ```
-3. Build the plugin:
+4. Build the plugin:
    ```bash
    npm run build
    ```
-4. Enable the plugin in Obsidian Settings → Community Plugins
+5. Enable the plugin in Obsidian Settings → Community Plugins
 
 ## Setup
 
@@ -46,11 +53,95 @@ Obsidian plugin for MultiMuse bot integration - track Discord threads and send m
 
 1. Open Obsidian Settings → Multimuse Obsidian
 2. Paste your API key in the "API Key" field
-3. Your user ID will be automatically detected from the API key
-4. Set poll interval (default: 15 minutes)
-5. Set scenes folder (default: "RP Scenes")
-6. (Optional) Set Obsidian Base path for scene tracking
-7. Enable polling
+3. Your Discord user ID will be automatically detected from the API key
+4. Configure other settings:
+   - **Enable Polling**: Turn automatic checking on/off
+   - **Poll Interval**: How often to check for new replies (5-60 minutes)
+   - **Scenes Folder**: Folder containing your scene files (default: "RP Scenes")
+   - **Obsidian Base Path**: Optional path to Base file for scene tracking
+   - **Track Roleplay Property**: Automatically extract "Roleplay" from folder path
+   - **Track Is Active? Property**: Automatically add "Is Active?" property (defaults to true)
+
+## Usage
+
+### Creating New Scenes
+
+1. Use the command **"Create New Scene"** (Command Palette or ribbon button)
+2. Select a muse from the list
+3. Enter the Discord thread/channel URL
+4. Select the folder location (or create a new one)
+5. Enter the scene name
+6. Set the number of participants
+7. The scene file will be created with all necessary frontmatter
+
+### Syncing from Tracker
+
+1. Use the command **"Sync from Tracker"**
+2. For each tracked thread, select the folder location
+3. Scene files will be created automatically with frontmatter populated from the bot
+
+### Sending Messages as Muse
+
+1. Open a scene file in Obsidian
+2. Select the text you want to send
+3. Right-click → **"Send as Muse"**
+4. If multiple characters are in the frontmatter, select which muse to post as
+5. The message will be automatically posted to the Discord thread
+
+### Scene File Format
+
+Your scene files should have frontmatter like this:
+
+```markdown
+---
+Link: https://discord.com/channels/123456789/987654321/111222333444555666
+Characters:
+  - Bel
+  - Another Character
+Roleplay: For The Greeks
+Participants: 2
+Replied?: false
+Is Active?: true
+Created: 2024-01-15
+---
+
+[Scene content here]
+```
+
+**Required fields:**
+- `Link`: Full Discord thread URL
+- `Characters`: Array of character/muse names (used for "Send as Muse")
+
+**Auto-updated fields:**
+- `Replied?`: Automatically updated by the plugin (true = your turn, false = not your turn)
+- `Participants`: Automatically updated with thread participant count
+
+**Auto-added fields (if enabled in settings):**
+- `Roleplay`: Extracted from folder path (e.g., "For The Greeks" from "RP Scenes/For The Greeks/Twin Flames")
+- `Is Active?`: Automatically set to `true` for new scenes
+
+## Commands
+
+- **Check Discord Threads Now**: Manually trigger a check for all scenes
+- **Toggle Discord Polling**: Enable/disable automatic polling
+- **Create New Scene**: Create a new scene file with muse selection
+- **Sync from Tracker**: Sync scenes from bot tracker to Obsidian
+
+## Settings
+
+### Core Settings
+- **Enable Polling**: Turn automatic checking on/off
+- **API Key**: Your MultiMuse API key (auto-detects user ID)
+- **Poll Interval**: How often to check (5-60 minutes)
+- **Scenes Folder**: Folder containing your scene files
+- **Obsidian Base Path**: Optional path to Base file for scene tracking
+
+### Scene Properties
+- **Track Roleplay Property**: Automatically add "Roleplay" property from folder path
+- **Track Is Active? Property**: Automatically add "Is Active?" property (defaults to true)
+
+### Read-Only Information
+- **Detected User ID**: Your Discord user ID (automatically detected from API key)
 
 ## How It Works
 
@@ -65,52 +156,21 @@ Obsidian plugin for MultiMuse bot integration - track Discord threads and send m
 
 ### Send as Muse
 
-1. Select text in a scene file
-2. Right-click → "Send as Muse"
-3. If multiple characters in frontmatter, select which muse to post as
-4. Message is automatically posted to the Discord thread via the MultiMuse API
-5. Long messages are automatically split to respect Discord's limits
+1. Selected text is extracted from the editor
+2. Frontmatter is read to get `Link` and `Characters`
+3. Thread ID is extracted from the Discord URL
+4. If multiple characters, a selection modal appears
+5. Message is posted via the MultiMuse API
+6. Long messages are automatically split to respect Discord's limits
 
-## Scene File Format
+### Scene Creation
 
-Your scene files should have frontmatter like this:
-
-```markdown
----
-Link: https://discord.com/channels/123456789/987654321/111222333444555666
-Characters:
-  - Bel
-  - Another Character
-Participants: 2
-Replied?: false
-Is Active?: true
----
-
-[Scene content here]
-```
-
-**Required fields:**
-- `Link`: Full Discord thread URL
-- `Characters`: Array of character/muse names (used for "Send as Muse")
-
-**Auto-updated fields:**
-- `Replied?`: Automatically updated by the plugin (true = your turn, false = not your turn)
-- `Participants`: Automatically updated with thread participant count
-
-## Commands
-
-- **Check Discord Threads Now**: Manually trigger a check
-- **Toggle Discord Polling**: Enable/disable automatic polling
-- **Create New Scene**: Create a new scene file with muse selection
-- **Sync from Tracker**: Sync scenes from bot tracker to Obsidian
-
-## Settings
-
-- **Enable Polling**: Turn automatic checking on/off
-- **API Key**: Your MultiMuse API key (auto-detects user ID)
-- **Poll Interval**: How often to check (5-60 minutes)
-- **Scenes Folder**: Folder containing your scene files
-- **Obsidian Base Path**: Optional path to Base file for scene tracking
+1. Muse is selected from available muses (fetched from API)
+2. Discord thread URL is validated
+3. Folder location is selected (with context showing which muse)
+4. Scene file is created with frontmatter
+5. Scene is registered with the MultiMuse API
+6. File is marked as "recently created" to prevent immediate state updates
 
 ## Troubleshooting
 
@@ -141,13 +201,58 @@ Is Active?: true
 - Check that the selected muse exists and is accessible
 - Verify your API key is configured correctly
 
+### Scenes marked as "Replied?" incorrectly
+- This can happen if the bot doesn't have access to the channel (403 Forbidden)
+- The plugin includes safeguards to prevent incorrect updates
+- Newly created scenes are protected from immediate updates for 60 seconds
+- Check the bot console for access errors
+
+### Rate Limiting
+- Discord API has rate limits
+- If you hit limits, increase the poll interval
+- The plugin handles rate limits gracefully
+
 ## Privacy & Security
 
 - Your API key is stored locally in Obsidian's settings
 - The plugin only accesses threads you've linked in your scene files
 - All communication goes through the MultiMuse bot API
 - User ID is automatically detected from API key (no manual entry needed)
+- No data is sent to external servers except the MultiMuse bot API
+
+## Development
+
+### Building
+
+```bash
+npm run build
+```
+
+### Watch Mode (for development)
+
+```bash
+npm run dev
+```
+
+This will watch for changes and rebuild automatically.
+
+### Project Structure
+
+- `main.ts`: Main plugin code
+- `manifest.json`: Plugin manifest
+- `package.json`: Dependencies and build scripts
+- `esbuild.config.mjs`: Build configuration
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
 MIT
+
+## Credits
+
+- **Author**: BackstagePass Group
+- **Plugin**: Multimuse Obsidian
+- **Version**: 1.3.0
