@@ -1,4 +1,5 @@
 # Multimuse Obsidian
+For use with the BRAT Plugin for the best experiance.
 
 An Obsidian plugin for seamless integration with the MultiMuse Discord bot. Track Discord roleplay threads, send messages as muses directly from Obsidian, and automatically sync scene states.
 
