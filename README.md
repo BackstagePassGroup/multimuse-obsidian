@@ -18,29 +18,7 @@ An Obsidian plugin for seamless integration with the MultiMuse Discord bot. Trac
 
 ### Manual Installation
 
-1. Download the latest release from the [Releases](https://github.com/yourusername/multimuse-obsidian/releases) page
-2. Extract the `multimuse-obsidian` folder to your Obsidian vault's `.obsidian/plugins/` directory
-3. Open Obsidian Settings → Community Plugins
-4. Enable "Multimuse Obsidian"
-5. Go to Settings → Multimuse Obsidian and configure your API key
-
-### Development Installation
-
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/yourusername/multimuse-obsidian.git
-   ```
-2. Copy the repository to `.obsidian/plugins/multimuse-obsidian`
-3. Install dependencies:
-   ```bash
-   cd .obsidian/plugins/multimuse-obsidian
-   npm install
-   ```
-4. Build the plugin:
-   ```bash
-   npm run build
-   ```
-5. Enable the plugin in Obsidian Settings → Community Plugins
+Install via [BRAT](https://obsidian.md/plugins?id=obsidian42-brat) with https://github.com/BackstagePassGroup/multimuse-obsidian
 
 ## Setup
 
@@ -221,28 +199,6 @@ Created: 2024-01-15
 - User ID is automatically detected from API key (no manual entry needed)
 - No data is sent to external servers except the MultiMuse bot API
 
-## Development
-
-### Building
-
-```bash
-npm run build
-```
-
-### Watch Mode (for development)
-
-```bash
-npm run dev
-```
-
-This will watch for changes and rebuild automatically.
-
-### Project Structure
-
-- `main.ts`: Main plugin code
-- `manifest.json`: Plugin manifest
-- `package.json`: Dependencies and build scripts
-- `esbuild.config.mjs`: Build configuration
 
 ## Contributing
 
@@ -256,4 +212,3 @@ MIT
 
 - **Author**: BackstagePass Group
 - **Plugin**: Multimuse Obsidian
-- **Version**: 1.3.0
