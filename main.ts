@@ -14,8 +14,11 @@ interface MultimuseObsidianSettings {
 	trackIsActive: boolean; // Whether to add Is Active? property (defaulting to true)
 }
 
+/** Canonical API base URL (no trailing slash). Old IP:port configs are migrated to this on load. */
+const MULTIMUSE_API_BASE = 'https://api.multimuse.app';
+
 const DEFAULT_SETTINGS: MultimuseObsidianSettings = {
-	botApiUrl: 'http://216.201.73.233:9056', // Hidden from user for security
+	botApiUrl: MULTIMUSE_API_BASE,
 	pollInterval: 15,
 	scenesFolder: 'RP Scenes',
 	basePath: '',
@@ -34,6 +37,7 @@ interface MuseInfo {
 	tags: string;
 	owner_id: number;
 	is_shared: boolean;
+	muse_id?: string | null; // Optional: for API calls (alias-safe); display always uses name
 }
 
 export default class MultimuseObsidian extends Plugin {
@@ -103,6 +107,20 @@ export default class MultimuseObsidian extends Plugin {
 			}
 		});
 
+		// Add command to insert Discord @ mention (guild members from Link property)
+		this.addCommand({
+			id: 'insert-mention',
+			name: 'Insert @ mention',
+			callback: async () => {
+				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+				if (!view) {
+					new Notice('Open a scene note (with Link in frontmatter) and try again.');
+					return;
+				}
+				await this.insertMentionAtCursor(view);
+			}
+		});
+
 		// Watch for scene file creation/modification to check state
 		this.registerEvent(
 			this.app.vault.on('modify', async (file) => {
@@ -120,9 +138,20 @@ export default class MultimuseObsidian extends Plugin {
 			})
 		);
 
-		// Add context menu item for sending text as muse
+		// Add context menu items for scene editor
 		this.registerEvent(
 			this.app.workspace.on('editor-menu', (menu, editor, view) => {
+				menu.addItem((item) => {
+					item.setTitle('Insert @ mention')
+						.setIcon('at-sign')
+						.onClick(async () => {
+							if (view instanceof MarkdownView) {
+								await this.insertMentionAtCursor(view);
+							} else {
+								new Notice('This feature requires a markdown view.');
+							}
+						});
+				});
 				menu.addItem((item) => {
 					item.setTitle('Send as Muse')
 						.setIcon('message-square')
@@ -148,6 +177,17 @@ export default class MultimuseObsidian extends Plugin {
 		// Ensure botApiUrl always uses default if empty or not set
 		if (!this.settings.botApiUrl || this.settings.botApiUrl.trim() === '') {
 			this.settings.botApiUrl = DEFAULT_SETTINGS.botApiUrl;
+		} else {
+			// Migrate old URLs to api.multimuse.app (non-breaking update after server/hostname change)
+			const u = this.settings.botApiUrl.trim();
+			const isOldUrl =
+				u.includes(':9056') ||
+				u === 'http://216.201.73.233:9056' ||
+				/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\/?$/i.test(u);
+			if (isOldUrl && u !== MULTIMUSE_API_BASE) {
+				this.settings.botApiUrl = MULTIMUSE_API_BASE;
+				await this.saveSettings();
+			}
 		}
 	}
 
@@ -184,10 +224,10 @@ export default class MultimuseObsidian extends Plugin {
 	 * @returns Bot API URL string
 	 */
 	getBotApiUrl(): string {
-		if (!this.settings.botApiUrl || this.settings.botApiUrl.trim() === '') {
-			return DEFAULT_SETTINGS.botApiUrl;
-		}
-		return this.settings.botApiUrl;
+		const base = !this.settings.botApiUrl || this.settings.botApiUrl.trim() === ''
+			? DEFAULT_SETTINGS.botApiUrl
+			: this.settings.botApiUrl.trim();
+		return base.replace(/\/+$/, ''); // no trailing slash
 	}
 
 	/**
@@ -560,15 +600,18 @@ export default class MultimuseObsidian extends Plugin {
 			}
 
 			const state = data.state;
-			console.log(`[MultimuseObsidian] Scene ${file.basename} is tracked. State:`, JSON.stringify(state));
+			// API may return 'replied' and/or 'is_from_character' (same meaning)
+			const repliedValue = state.replied ?? state.is_from_character;
+			console.log(`[MultimuseObsidian] Scene ${file.basename} is tracked. State:`, JSON.stringify(state), 'repliedValue=', repliedValue);
 			
-			// Only update if state.replied is explicitly defined (not undefined/null)
-			if (state.replied === undefined || state.replied === null) {
+			// Only update if we have a definite replied value (replied or is_from_character)
+			if (repliedValue === undefined || repliedValue === null) {
 				console.log(`[MultimuseObsidian] Scene ${file.basename} has undefined/null replied value - skipping update`);
 				return false;
 			}
-			
-			return await this.updateSceneFromState(file, cache, state);
+			// Normalize state so updateSceneFromState sees a single field
+			const normalizedState = { ...state, replied: repliedValue };
+			return await this.updateSceneFromState(file, cache, normalizedState);
 		} catch (error) {
 			console.error(`[MultimuseObsidian] Error querying scene state for ${file.path}:`, error);
 			return false;
@@ -579,9 +622,10 @@ export default class MultimuseObsidian extends Plugin {
 		/**Update scene frontmatter from API state data.*/
 		let updated = false;
 
-		// Only update if state.replied is explicitly defined (boolean or string 'true'/'false')
-		if (state.replied === undefined || state.replied === null) {
-			console.log(`[MultimuseObsidian] ${file.basename}: state.replied is undefined/null - skipping update`);
+		// Use replied or is_from_character (API may send either)
+		const repliedRaw = state.replied ?? state.is_from_character;
+		if (repliedRaw === undefined || repliedRaw === null) {
+			console.log(`[MultimuseObsidian] ${file.basename}: state.replied/is_from_character is undefined/null - skipping update`);
 			return false;
 		}
 
@@ -597,26 +641,23 @@ export default class MultimuseObsidian extends Plugin {
 		const currentRepliedRaw = cache.frontmatter['Replied?'];
 		// Handle both boolean and string values
 		const currentReplied = currentRepliedRaw === true || currentRepliedRaw === 'true' || currentRepliedRaw === 'True';
-		// Only treat as true if explicitly true or 'true' string
-		const shouldBeReplied = state.replied === true || state.replied === 'true'; // true = your turn, false = not your turn
+		// true = you've replied (no need to reply), false = need to reply
+		const shouldBeReplied = repliedRaw === true || repliedRaw === 'true';
 
-		console.log(`[MultimuseObsidian] ${file.basename}: Current Replied?=${currentReplied}, API replied=${state.replied}, shouldBeReplied=${shouldBeReplied}`);
+		console.log(`[MultimuseObsidian] ${file.basename}: Current Replied?=${currentReplied}, API replied=${repliedRaw}, shouldBeReplied=${shouldBeReplied}`);
 
+		// Always apply API state so Replied? unchecks when someone replies back (your turn again)
 		if (currentReplied !== shouldBeReplied) {
 			console.log(`[MultimuseObsidian] ${file.basename}: Updated Replied? to ${shouldBeReplied}`);
 			await this.updateFrontmatter(file, 'Replied?', shouldBeReplied);
 			updated = true;
 		}
 
-		// Update Participants field
-		const currentParticipants = cache.frontmatter['Participants'] || cache.frontmatter['participants'];
-		const shouldBeParticipants = state.participants || 2;
 
-		if (currentParticipants !== shouldBeParticipants) {
-			console.log(`[MultimuseObsidian] ${file.basename}: Updated Participants to ${shouldBeParticipants}`);
-			await this.updateFrontmatter(file, 'Participants', shouldBeParticipants);
-			updated = true;
-		}
+
+		// Do NOT overwrite Participants from API/thread state. The plugin uses thread tracker
+		// for reply state only; Participants is always user-editable in frontmatter so the user
+		// can set it regardless of whether the scene is linked to a tracked thread.
 
 		return updated;
 	}
@@ -643,6 +684,14 @@ export default class MultimuseObsidian extends Plugin {
 		// Small delay to avoid checking during file creation
 		await new Promise(resolve => setTimeout(resolve, 1000));
 
+		const cache = this.app.metadataCache.getFileCache(file);
+		if (cache?.frontmatter) {
+			// Sync Is Active? to the tracker so unchecking removes the scene from MultiMuse
+			await this.syncSceneActiveStatusToApi(file, cache);
+			// Sync Participants to the tracker so "your turn" / Replied? use the correct count
+			await this.syncSceneParticipantsToApi(file, cache);
+		}
+
 		// Query the scene state - this will auto-detect if it matches a tracked thread
 		try {
 			await this.querySceneState(file);
@@ -652,6 +701,82 @@ export default class MultimuseObsidian extends Plugin {
 		}
 	}
 
+	/**
+	 * Sync the scene's "Is Active?" frontmatter to the MultiMuse API.
+	 * When unchecked, the bot sets is_active=0 so the scene is removed from the tracker.
+	 */
+	async syncSceneActiveStatusToApi(file: TFile, cache: { frontmatter?: Record<string, unknown> }): Promise<void> {
+		const link = cache.frontmatter?.['Link'];
+		if (!link) return; // No Link = not a tracked scene
+
+		const primaryUserId = await this.getPrimaryUserId();
+		if (!primaryUserId) return;
+
+		const threadId = this.extractThreadIdFromUrl(String(link));
+		const raw = cache.frontmatter?.['Is Active?'];
+		const isActive = raw !== false && raw !== 'false';
+
+		try {
+			const body: Record<string, unknown> = {
+				scene_path: file.path,
+				user_id: primaryUserId,
+				is_active: isActive
+			};
+			if (threadId) body.thread_id = threadId;
+
+			const response = await requestUrl({
+				url: `${this.getBotApiUrl()}/api/v1/scenes/update-active`,
+				method: 'POST',
+				headers: { ...this.getApiHeaders(), 'Content-Type': 'application/json' },
+				body: JSON.stringify(body)
+			});
+			if (response.status === 200) {
+				if (!isActive) {
+					console.log(`[MultimuseObsidian] Synced Is Active?=false for ${file.path} - removed from tracker`);
+				}
+			}
+		} catch (e) {
+			console.debug(`[MultimuseObsidian] Could not sync Is Active? for ${file.path}:`, e);
+		}
+	}
+
+	/**
+	 * Sync the scene's "Participants" frontmatter to the MultiMuse API.
+	 * So the bot's "your turn" / Replied? logic uses the correct participant count.
+	 */
+	async syncSceneParticipantsToApi(file: TFile, cache: { frontmatter?: Record<string, unknown> }): Promise<void> {
+		const link = cache.frontmatter?.['Link'];
+		if (!link) return;
+
+		const primaryUserId = await this.getPrimaryUserId();
+		if (!primaryUserId) return;
+
+		const threadId = this.extractThreadIdFromUrl(String(link));
+		const raw = cache.frontmatter?.['Participants'];
+		const participants = typeof raw === 'number' && raw >= 1 ? raw : parseInt(String(raw || '2'), 10);
+		if (isNaN(participants) || participants < 1) return;
+
+		try {
+			const body: Record<string, unknown> = {
+				scene_path: file.path,
+				user_id: primaryUserId,
+				participants: participants
+			};
+			if (threadId) body.thread_id = threadId;
+
+			const response = await requestUrl({
+				url: `${this.getBotApiUrl()}/api/v1/scenes/update-participants`,
+				method: 'POST',
+				headers: { ...this.getApiHeaders(), 'Content-Type': 'application/json' },
+				body: JSON.stringify(body)
+			});
+			if (response.status === 200) {
+				console.debug(`[MultimuseObsidian] Synced Participants=${participants} for ${file.path}`);
+			}
+		} catch (e) {
+			console.debug(`[MultimuseObsidian] Could not sync Participants for ${file.path}:`, e);
+		}
+	}
 
 	getSceneFiles(): TFile[] {
 		const folder = this.app.vault.getAbstractFileByPath(this.settings.scenesFolder);
@@ -662,6 +787,19 @@ export default class MultimuseObsidian extends Plugin {
 		const files: TFile[] = [];
 		this.collectMarkdownFiles(folder, files);
 		return files;
+	}
+
+	/** Build a map of thread_id (from Link property) -> TFile for all scene files that have a valid Link. */
+	getExistingSceneLinksByThreadId(): Map<string, TFile> {
+		const map = new Map<string, TFile>();
+		for (const file of this.getSceneFiles()) {
+			const cache = this.app.metadataCache.getFileCache(file);
+			const link = cache?.frontmatter?.['Link'];
+			if (!link || typeof link !== 'string') continue;
+			const threadId = this.extractThreadIdFromUrl(link);
+			if (threadId) map.set(threadId, file);
+		}
+		return map;
 	}
 
 	collectMarkdownFiles(fileOrFolder: any, files: TFile[]): void {
@@ -969,18 +1107,22 @@ export default class MultimuseObsidian extends Plugin {
 				// Also create thread tracking (optional - don't fail if this errors)
 				// This may fail if bot can't access the thread, which is okay
 				try {
+					const trackBody: Record<string, unknown> = {
+						thread_id: threadInfo.threadId,
+						user_id: primaryUserId,
+						muse_name: selectedMuse.name,
+						participants: participants,
+						scene_path: createdFile.path,
+						guild_id: threadInfo.guildId || null
+					};
+					if (selectedMuse.muse_id) {
+						trackBody.muse_id = selectedMuse.muse_id;
+					}
 					const trackResponse = await requestUrl({
 						url: `${this.getBotApiUrl()}/api/v1/threads/track`,
 						method: 'POST',
 						headers: this.getApiHeaders(),
-						body: JSON.stringify({
-							thread_id: threadInfo.threadId,  // Send as string to avoid precision loss
-							user_id: primaryUserId,  // Send as string
-							muse_name: selectedMuse.name,
-							participants: participants,
-							scene_path: createdFile.path,
-							guild_id: threadInfo.guildId || null  // Send as string or null
-						})
+						body: JSON.stringify(trackBody)
 					});
 					
 					if (trackResponse.status === 200) {
@@ -1073,20 +1215,22 @@ export default class MultimuseObsidian extends Plugin {
 				return;
 			}
 
+			// Cross-check: which thread IDs already have a scene in Obsidian (via Link property)?
+			const existingLinksByThreadId = this.getExistingSceneLinksByThreadId();
+
 			let createdCount = 0;
 			let updatedCount = 0;
 
 			for (const thread of threads) {
-				const threadId = thread.thread_id;
+				const threadId = String(thread.thread_id ?? '');
 				const museName = thread.muse_name;
 				const participants = thread.participants || 2;
 				const existingScenePath = thread.scene_path;
 
-				// Check if scene already exists
+				// 1) Scene already exists at the path the tracker knows about
 				if (existingScenePath) {
 					const existingFile = this.app.vault.getAbstractFileByPath(existingScenePath);
 					if (existingFile && existingFile instanceof TFile) {
-						// Update Base if configured
 						if (this.settings.basePath) {
 							await this.updateBaseRecord(existingFile, thread);
 						}
@@ -1095,11 +1239,19 @@ export default class MultimuseObsidian extends Plugin {
 					}
 				}
 
-				// Create new scene file
-				// Only create if we have a valid scene_path (thread is linked to Obsidian)
-				// If no scene_path, this thread isn't meant to be an Obsidian scene
+				// 2) No scene_path from tracker, but an Obsidian note already has this thread in its Link
+				const existingFileByLink = existingLinksByThreadId.get(threadId);
+				if (existingFileByLink) {
+					if (this.settings.basePath) {
+						await this.updateBaseRecord(existingFileByLink, thread);
+					}
+					updatedCount++;
+					continue;
+				}
+
+				// 3) Create new scene only when we have a scene_path from tracker and no existing note for this thread
+				// (If no scene_path, this thread isn't linked to Obsidian from the bot's side)
 				if (!existingScenePath) {
-					// Skip threads without scene_path - they're not Obsidian scenes
 					continue;
 				}
 				
@@ -1530,6 +1682,78 @@ export default class MultimuseObsidian extends Plugin {
 		});
 	}
 
+	/**
+	 * Fetch guild members from the bot API using guild_id from the current note's Link property,
+	 * then insert a Discord mention <@userId> at the cursor (or replace selection).
+	 */
+	async insertMentionAtCursor(view: MarkdownView): Promise<void> {
+		const file = view.file;
+		if (!file) {
+			new Notice('No active file.');
+			return;
+		}
+		const cache = this.app.metadataCache.getFileCache(file);
+		if (!cache?.frontmatter) {
+			new Notice('No frontmatter. Add a Link property (Discord thread URL) to this note.');
+			return;
+		}
+		const link = cache.frontmatter['Link'];
+		if (!link) {
+			new Notice('No Link property. Add the Discord thread URL to frontmatter to use @ mentions.');
+			return;
+		}
+		const threadInfo = this.extractThreadInfoFromUrl(link);
+		if (!threadInfo?.guildId) {
+			new Notice('Link is not a valid Discord channel URL (could not get server ID).');
+			return;
+		}
+		if (!this.settings.apiKey) {
+			new Notice('API key required in plugin settings to fetch server members.');
+			return;
+		}
+		let members: { id: string; username: string; display_name: string }[];
+		try {
+			const url = `${this.getBotApiUrl()}/api/v1/guilds/${threadInfo.guildId}/members`;
+			const response = await requestUrl({
+				url,
+				method: 'GET',
+				headers: this.getApiHeaders()
+			});
+			if (response.status !== 200) {
+				if (!this.handleApiError(response, 'insertMention - guild members')) {
+					new Notice('Could not load server members. Check API and that the bot is in the server.');
+				}
+				return;
+			}
+			const data = JSON.parse(response.text);
+			members = data.members || [];
+		} catch (e) {
+			console.error('[MultimuseObsidian] insertMention fetch error:', e);
+			new Notice('Failed to fetch server members. Check connection and API key.');
+			return;
+		}
+		if (members.length === 0) {
+			new Notice('No members returned for this server. Bot may need Server Members intent.');
+			return;
+		}
+		const labels = members.map(m => {
+			const d = m.display_name || m.username;
+			return m.username !== d ? `${d} (@${m.username})` : d;
+		});
+		const idx = await this.showSuggester(labels, members, 'Insert @ mention – choose user');
+		if (idx === null || idx < 0) return;
+		const chosen = members[idx];
+		const mention = `<@${chosen.id}>`;
+		const editor = view.editor;
+		const sel = editor.getSelection();
+		if (sel) {
+			editor.replaceSelection(mention);
+		} else {
+			editor.replaceRange(mention, editor.getCursor());
+		}
+		new Notice(`Inserted @${chosen.display_name || chosen.username}`);
+	}
+
 	async sendSelectionAsMuse(editor: Editor, view: MarkdownView): Promise<void> {
 		/**Send selected text as a muse to Discord thread from frontmatter properties.*/
 		// Get selected text
@@ -1626,17 +1850,27 @@ export default class MultimuseObsidian extends Plugin {
 			return;
 		}
 
-		// Check if selected muse exists (case-insensitive fuzzy match)
-		const museExists = muses.some(m => {
+		// Find matching muse (case-insensitive fuzzy) for validation and optional muse_id
+		const matchedMuse = muses.find(m => {
 			const museLower = m.name.toLowerCase().trim();
 			const selectedLower = selectedMuse.toLowerCase().trim();
-			// Exact match or contains check
 			return museLower === selectedLower || museLower.includes(selectedLower) || selectedLower.includes(museLower);
 		});
 
-		if (!museExists) {
+		if (!matchedMuse) {
 			new Notice(`Muse "${selectedMuse}" not found or not accessible. Available muses: ${muses.map(m => m.name).join(', ')}`);
 			return;
+		}
+
+		// Build post body: use muse_id when available (alias-safe), keep muse_name for display/fallback
+		const postBody: Record<string, unknown> = {
+			thread_id: threadId,
+			muse_name: selectedMuse,
+			content: selection.trim(),
+			user_id: primaryUserId
+		};
+		if (matchedMuse.muse_id) {
+			postBody.muse_id = matchedMuse.muse_id;
 		}
 
 		// Post message via API
@@ -1646,12 +1880,7 @@ export default class MultimuseObsidian extends Plugin {
 				url: url,
 				method: 'POST',
 				headers: this.getApiHeaders(),
-				body: JSON.stringify({
-					thread_id: threadId,
-					muse_name: selectedMuse,
-					content: selection.trim(),
-					user_id: primaryUserId
-				})
+				body: JSON.stringify(postBody)
 			});
 
 			if (response.status === 200) {
@@ -1840,7 +2069,7 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 		infoEl.createEl('h3', { text: 'How It Works' });
 		infoEl.createEl('p', { text: 'This plugin queries the Multimuse API to check if your scene files match tracked threads and updates the "Replied?" and "Participants" fields.' });
 		infoEl.createEl('p', { text: '• Scenes are matched by Link (thread_id) and Characters properties' });
-		infoEl.createEl('p', { text: '• If scene matches a tracked thread: Updates Replied? (true = your turn, false = not your turn) and Participants' });
+		infoEl.createEl('p', { text: '• If scene matches a tracked thread: Updates Replied? only (true = you replied, false = need to reply). Participants is always editable in frontmatter.' });
 		infoEl.createEl('p', { text: '• If scene does not match: No updates (scene is not tracked)' });
 		infoEl.createEl('p', { text: '• Make sure your scene files have a "Link" field (Discord thread URL) and "Characters" field (array) in frontmatter' });
 		infoEl.createEl('p', { text: '• Uses Multimuse API - requires an API key for authentication' });

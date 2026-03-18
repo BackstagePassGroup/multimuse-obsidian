@@ -11,7 +11,7 @@ An Obsidian plugin for seamless integration with the MultiMuse Discord bot. Trac
 - ✅ **Sync from Tracker**: Import tracked threads from the bot and create scene files
 - ✅ **Property Tracking**: Automatically adds "Roleplay" and "Is Active?" properties based on folder structure
 - ✅ **Configurable Polling**: Automatically checks Discord threads for new replies (5-60 minute intervals)
-- ✅ **Frontmatter Updates**: Automatically updates `Replied?` and `Participants` fields based on thread state
+- ✅ **Frontmatter Updates**: Automatically updates `Replied?` based on thread state. `Participants` is always user-editable (plugin does not overwrite it).
 
 ## Installation
 
@@ -113,8 +113,7 @@ Created: 2024-01-15
 - `Characters`: Array of character/muse names (used for "Send as Muse")
 
 **Auto-updated fields:**
-- `Replied?`: Automatically updated by the plugin (true = your turn, false = not your turn)
-- `Participants`: Automatically updated with thread participant count
+- `Replied?`: Automatically updated by the plugin (true = you replied, false = need to reply). Participants is not overwritten—you can always edit it in frontmatter.
 
 **Auto-added fields (if enabled in settings):**
 - `Roleplay`: Extracted from folder path (e.g., "For The Greeks" from "RP Scenes/For The Greeks/Twin Flames")
@@ -151,8 +150,7 @@ Created: 2024-01-15
 2. For each file with a `Link` and `Characters` field in frontmatter:
    - Extracts the Discord thread ID from the URL
    - Queries the MultiMuse API for thread state
-   - Updates `Replied?` field (true = your turn, false = not your turn)
-   - Updates `Participants` field
+   - Updates `Replied?` field only (true = you replied, false = need to reply). Participants is left as-is so you can always change it.
 
 ### Send as Muse
 
