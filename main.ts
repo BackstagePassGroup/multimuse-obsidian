@@ -45,6 +45,9 @@ export default class MultimuseObsidian extends Plugin {
 	pollIntervalId: number | null = null;
 	museCache: Map<string, MuseInfo[]> = new Map(); // user_id (as string) -> muses
 	recentlyCreatedFiles: Set<string> = new Set(); // Track recently created files to skip immediate checking
+	// Cache of last-seen "Is Active?" value per scene path so we only sync when the user actually toggles it.
+	// This prevents Obsidian from resurrecting scenes that StageHand or the bot have already ended/removed.
+	sceneActiveCache: Map<string, boolean> = new Map();
 
 	async onload() {
 		await this.loadSettings();
@@ -704,6 +707,12 @@ export default class MultimuseObsidian extends Plugin {
 	/**
 	 * Sync the scene's "Is Active?" frontmatter to the MultiMuse API.
 	 * When unchecked, the bot sets is_active=0 so the scene is removed from the tracker.
+	 *
+	 * IMPORTANT: The bot/database is the source of truth for is_active. Obsidian should only
+	 * push changes when the user actually toggles "Is Active?" in the note. To avoid
+	 * resurrecting scenes that were ended from StageHand or `/scene end`, this method
+	 * compares the current frontmatter value against a cached last-seen value and only
+	 * calls the API when it has changed.
 	 */
 	async syncSceneActiveStatusToApi(file: TFile, cache: { frontmatter?: Record<string, unknown> }): Promise<void> {
 		const link = cache.frontmatter?.['Link'];
@@ -715,6 +724,21 @@ export default class MultimuseObsidian extends Plugin {
 		const threadId = this.extractThreadIdFromUrl(String(link));
 		const raw = cache.frontmatter?.['Is Active?'];
 		const isActive = raw !== false && raw !== 'false';
+
+		// Only sync when the value has actually changed in this Obsidian session.
+		// - First time we see a file, record the value but do NOT push to the API.
+		// - Subsequent changes (true -> false, false -> true) are treated as user intent.
+		const prev = this.sceneActiveCache.get(file.path);
+		if (prev === undefined) {
+			this.sceneActiveCache.set(file.path, isActive);
+			// Do not call the API on first sight of a file; this avoids overwriting
+			// scenes that were ended or deactivated from StageHand while Obsidian was closed.
+			return;
+		}
+		if (prev === isActive) {
+			// No change in "Is Active?" — nothing to sync.
+			return;
+		}
 
 		try {
 			const body: Record<string, unknown> = {
@@ -731,6 +755,7 @@ export default class MultimuseObsidian extends Plugin {
 				body: JSON.stringify(body)
 			});
 			if (response.status === 200) {
+				this.sceneActiveCache.set(file.path, isActive);
 				if (!isActive) {
 					console.log(`[MultimuseObsidian] Synced Is Active?=false for ${file.path} - removed from tracker`);
 				}
