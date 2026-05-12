@@ -106,12 +106,11 @@ function getErrorMessage(error: unknown): string {
 	return 'Unknown error';
 }
 
-function getErrorStatus(error: unknown): number | undefined {
-	if (error && typeof error === 'object') {
-		const details = error as { status?: unknown };
-		if (typeof details.status === 'number') return details.status;
-	}
-	return undefined;
+function frontmatterValueToString(value: unknown, fallback = ''): string {
+	if (value === null || value === undefined) return fallback;
+	if (typeof value === 'string') return value;
+	if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+	return fallback;
 }
 
 export default class MultimuseObsidian extends Plugin {
@@ -250,7 +249,11 @@ export default class MultimuseObsidian extends Plugin {
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		const loaded = await this.loadData() as unknown;
+		const savedSettings = loaded && typeof loaded === 'object'
+			? loaded as Partial<MultimuseObsidianSettings>
+			: {};
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, savedSettings);
 		// Ensure botApiUrl always uses default if empty or not set
 		if (!this.settings.botApiUrl || this.settings.botApiUrl.trim() === '') {
 			this.settings.botApiUrl = DEFAULT_SETTINGS.botApiUrl;
@@ -944,7 +947,8 @@ export default class MultimuseObsidian extends Plugin {
 		const map = new Map<string, TFile>();
 		for (const file of this.getSceneFiles()) {
 			const cache = this.app.metadataCache.getFileCache(file);
-			const link = cache?.frontmatter?.['Link'];
+			const frontmatter = this.getFrontmatter(cache);
+			const link = frontmatter?.['Link'];
 			if (!link || typeof link !== 'string') continue;
 			const threadId = this.extractThreadIdFromUrl(link);
 			if (threadId) map.set(threadId, file);
@@ -971,13 +975,17 @@ export default class MultimuseObsidian extends Plugin {
 
 		// Handle both array and single value
 		if (Array.isArray(characters)) {
-			return characters.map(c => String(c).trim());
+			return characters
+				.map(c => frontmatterValueToString(c).trim())
+				.filter(c => c.length > 0);
 		} else if (typeof characters === 'string') {
 			// Handle comma-separated string
 			return characters.split(',').map(c => c.trim()).filter(c => c.length > 0);
+		} else if (typeof characters === 'number' || typeof characters === 'boolean') {
+			return [frontmatterValueToString(characters).trim()];
 		}
 
-		return [String(characters).trim()];
+		return [];
 	}
 
 
@@ -1498,9 +1506,9 @@ export default class MultimuseObsidian extends Plugin {
 			
 			// Extract characters from frontmatter
 			const characters = this.getCharacterNames(frontmatter);
-			const link = frontmatter['Link'] || '';
-			const participants = frontmatter['Participants'] || 2;
-			const replied = frontmatter['Replied?'] || false;
+			const link = frontmatterValueToString(frontmatter['Link']);
+			const participants = frontmatterValueToString(frontmatter['Participants'], '2');
+			const replied = frontmatterValueToString(frontmatter['Replied?'], 'false');
 
 			// Check if scene already exists in table
 			if (baseContent.includes(`| ${file.basename} |`)) {
@@ -1781,12 +1789,12 @@ export default class MultimuseObsidian extends Plugin {
 			return;
 		}
 		const cache = this.app.metadataCache.getFileCache(file);
-		if (!cache?.frontmatter) {
+		const frontmatter = this.getFrontmatter(cache);
+		if (!frontmatter) {
 			new Notice('No frontmatter. Add a Link property (Discord thread URL) to this note.');
 			return;
 		}
-		const frontmatter = this.getFrontmatter(cache);
-		const link = frontmatter?.['Link'];
+		const link = frontmatter['Link'];
 		if (typeof link !== 'string') {
 			new Notice('No Link property. Add the Discord thread URL to frontmatter to use @ mentions.');
 			return;
@@ -2003,7 +2011,7 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		new Setting(containerEl)
-			.setName('Multimuse Settings')
+			.setName('Multimuse Tracker')
 			.setHeading();
 
 		// Enable/Disable toggle

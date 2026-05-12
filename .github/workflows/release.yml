@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+  attestations: write
+  id-token: write
+
+jobs:
+  release:
+    name: Build and release plugin
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build plugin
+        run: npm run build
+
+      - name: Stage release assets
+        run: |
+          mkdir -p release
+          cp main.js manifest.json styles.css release/
+
+      - name: Generate artifact attestations
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            release/main.js
+            release/manifest.json
+            release/styles.css
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            release/main.js \
+            release/manifest.json \
+            release/styles.css \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "Multimuse Tracker ${GITHUB_REF_NAME}"
