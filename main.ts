@@ -1,4 +1,4 @@
-import { Plugin, PluginSettingTab, Setting, Notice, TFile, TFolder, TAbstractFile, App, requestUrl, Modal, Editor, MarkdownView, CachedMetadata, RequestUrlResponse } from 'obsidian';
+import { Plugin, PluginSettingTab, Setting, Notice, TFile, TFolder, TAbstractFile, App, requestUrl, Modal, Editor, MarkdownView, CachedMetadata, RequestUrlResponse, Platform, Scope } from 'obsidian';
 
 interface MultimuseObsidianSettings {
 	botApiUrl: string; // Bot HTTP API URL (hidden from user UI for security)
@@ -121,6 +121,10 @@ export default class MultimuseObsidian extends Plugin {
 	// Cache of last-seen "Is Active?" value per scene path so we only sync when the user actually toggles it.
 	// This prevents Obsidian from resurrecting scenes that StageHand or the bot have already ended/removed.
 	sceneActiveCache: Map<string, boolean> = new Map();
+	/** True while the Create New Scene UI flow is running (blocks vault handlers from touching other notes). */
+	sceneCreationInProgress = false;
+	/** Swallows Enter between wizard modals so it cannot reach the editor. */
+	sceneCreationKeymapScope: Scope | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -165,14 +169,21 @@ export default class MultimuseObsidian extends Plugin {
 			}
 		});
 
-		// Add command to create new scene
+		// Add command to create new scene (icon for mobile toolbar; ribbon on desktop)
 		this.addCommand({
 			id: 'create-scene',
 			name: 'Create New Scene',
+			icon: 'file-plus',
 			callback: () => {
 				void this.createNewScene();
 			}
 		});
+
+		if (!Platform.isMobile) {
+			this.addRibbonIcon('file-plus', 'Create New Scene', () => {
+				void this.createNewScene();
+			});
+		}
 
 		// Add command to sync from tracker
 		this.addCommand({
@@ -663,6 +674,10 @@ export default class MultimuseObsidian extends Plugin {
 
 	async querySceneState(file: TFile): Promise<boolean> {
 		/**Query the tracker API for a specific scene's state and update frontmatter.*/
+		if (this.sceneCreationInProgress) {
+			return false;
+		}
+
 		// Skip checking if this file was recently created by the plugin
 		if (this.recentlyCreatedFiles.has(file.path)) {
 			console.log(`[MultimuseObsidian] querySceneState: Skipping check for recently created file: ${file.path}`);
@@ -797,6 +812,10 @@ export default class MultimuseObsidian extends Plugin {
 
 	async handleSceneFileChange(file: TFile): Promise<void> {
 		/**Handle scene file creation/modification - scenes are auto-detected when queried, no registration needed.*/
+		if (this.sceneCreationInProgress) {
+			return;
+		}
+
 		// Only process files in the scenes folder
 		if (!file.path.startsWith(this.settings.scenesFolder + '/')) {
 			return;
@@ -1074,11 +1093,39 @@ export default class MultimuseObsidian extends Plugin {
 
 	async createNewScene(): Promise<void> {
 		/**Create a new scene with muse selection, thread link, location, name, and participants.*/
+		if (this.sceneCreationInProgress) {
+			return;
+		}
+
 		if (!this.settings.apiKey) {
 			new Notice('API key must be configured in settings.');
 			return;
 		}
 
+		this.sceneCreationInProgress = true;
+		this.sceneCreationKeymapScope = new Scope(this.app.scope);
+		this.sceneCreationKeymapScope.register([], 'Enter', (evt) => {
+			evt.preventDefault();
+			return false;
+		});
+		this.app.keymap.pushScope(this.sceneCreationKeymapScope);
+		try {
+			// Flush the open note so Properties does not merge new-scene fields into it during the modal flow.
+			const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+			if (activeView?.file) {
+				await activeView.save();
+			}
+			await this.runCreateNewSceneFlow();
+		} finally {
+			if (this.sceneCreationKeymapScope) {
+				this.app.keymap.popScope(this.sceneCreationKeymapScope);
+				this.sceneCreationKeymapScope = null;
+			}
+			this.sceneCreationInProgress = false;
+		}
+	}
+
+	async runCreateNewSceneFlow(): Promise<void> {
 		// 1) Get muses from bot API for all configured user IDs
 		let muses: MuseInfo[] = [];
 		try {
@@ -1137,9 +1184,6 @@ export default class MultimuseObsidian extends Plugin {
 
 		const selectedMuse = muses[selectedMuseIndex];
 
-		// Small delay to ensure previous modal is fully closed
-		await new Promise(resolve => window.setTimeout(resolve, 100));
-
 		// 3) Get Discord thread/channel link
 		const threadUrl = await this.showInputPrompt('Enter Discord thread/channel URL');
 		if (!threadUrl) return;
@@ -1149,9 +1193,6 @@ export default class MultimuseObsidian extends Plugin {
 			new Notice('Invalid Discord URL format.');
 			return;
 		}
-
-		// Small delay before opening location modal
-		await new Promise(resolve => window.setTimeout(resolve, 100));
 
 		// 4) Get location (RP folder) - pass muse name for context
 		console.log(`[MultimuseObsidian] createNewScene: About to select location for muse "${selectedMuse.name}"`);
@@ -1842,9 +1883,32 @@ export default class MultimuseObsidian extends Plugin {
 		return `${RP_ROOT}/${relPath}`;
 	}
 
+	/**
+	 * Keep wizard keystrokes on the modal so Enter does not reach the markdown editor behind it.
+	 */
+	isolateWizardModal(modal: Modal, onEnter?: () => void): void {
+		modal.shouldRestoreSelection = false;
+		modal.modalEl.setAttr('tabindex', '-1');
+
+		modal.scope.register([], 'Enter', (evt) => {
+			onEnter?.();
+			evt.preventDefault();
+			return false;
+		});
+
+		const trapEnter = (evt: KeyboardEvent) => {
+			if (evt.key === 'Enter') {
+				evt.preventDefault();
+				evt.stopPropagation();
+			}
+		};
+		modal.modalEl.addEventListener('keydown', trapEnter, { capture: true });
+		modal.containerEl.addEventListener('keydown', trapEnter, { capture: true });
+	}
+
 	showSuggester<T>(items: string[], _values: T[], title?: string): Promise<number | null> {
 		return new Promise((resolve) => {
-			// Create a modal with buttons
+			const plugin = this;
 			const modal = new (class extends Modal {
 				selectedIndex: number | null = null;
 				items: string[];
@@ -1854,16 +1918,13 @@ export default class MultimuseObsidian extends Plugin {
 					super(app);
 					this.items = items;
 					this.titleText = titleText || 'Select an option';
-					// Set title in constructor to ensure it's set before modal opens
-					this.titleEl.textContent = this.titleText;
 				}
 
 				onOpen() {
+					plugin.isolateWizardModal(this);
 					const { contentEl } = this;
 					contentEl.empty();
-					
-					// Ensure title is set (in case it was reset)
-					this.titleEl.textContent = this.titleText;
+					this.setTitle(this.titleText);
 					
 					// If title contains context (e.g., "for muse X"), extract and display prominently
 					if (this.titleText.includes('for')) {
@@ -1885,15 +1946,23 @@ export default class MultimuseObsidian extends Plugin {
 						});
 					}
 
+					let firstButton: HTMLButtonElement | null = null;
 					this.items.forEach((item, index) => {
 						const button = contentEl.createEl('button', {
 							text: item,
 							cls: ['mod-cta', 'multimuse-suggester-button']
 						});
+						if (!firstButton) {
+							firstButton = button;
+						}
 						button.onclick = () => {
 							this.selectedIndex = index;
 							this.close();
 						};
+					});
+
+					window.requestAnimationFrame(() => {
+						(firstButton ?? this.modalEl).focus();
 					});
 				}
 
@@ -1902,46 +1971,62 @@ export default class MultimuseObsidian extends Plugin {
 				}
 			})(this.app, items, title);
 
-			console.log(`[MultimuseObsidian] showSuggester: Opening modal with ${items.length} items, title: ${title || 'Select an option'}`);
-			// Use requestAnimationFrame to ensure modal opens after any previous modals are fully closed
-			window.requestAnimationFrame(() => {
-				modal.open();
-			});
+			modal.open();
 		});
 	}
 
 	showInputPrompt(prompt: string, defaultValue?: string): Promise<string | null> {
 		return new Promise((resolve) => {
-			// Use Obsidian's built-in modal for input
+			const plugin = this;
 			const modal = new (class extends Modal {
-				inputEl: HTMLInputElement;
+				inputEl!: HTMLInputElement;
 				value: string | null = null;
+				cancelled = false;
 
-				constructor(app: App, prompt: string, defaultValue?: string) {
+				constructor(app: App) {
 					super(app);
-					this.titleEl.textContent = prompt;
-					this.inputEl = this.contentEl.createEl('input', {
-						type: 'text',
-						value: defaultValue || '',
-						cls: 'multimuse-input'
-					});
-					this.inputEl.onkeydown = (e) => {
-						if (e.key === 'Enter') {
-							this.value = this.inputEl.value;
-							this.close();
-						}
-					};
+				}
+
+				confirm(): void {
+					const trimmed = this.inputEl.value.trim();
+					this.value = trimmed || null;
+					this.close();
 				}
 
 				onOpen() {
-					this.inputEl.focus();
-					this.inputEl.select();
+					plugin.isolateWizardModal(this, () => this.confirm());
+					this.setTitle(prompt);
+					const { contentEl } = this;
+					contentEl.empty();
+
+					this.inputEl = contentEl.createEl('input', {
+						type: 'text',
+						cls: 'multimuse-input',
+					});
+					this.inputEl.value = defaultValue || '';
+
+					new Setting(contentEl)
+						.addButton((btn) => btn
+							.setButtonText('Continue')
+							.setCta()
+							.onClick(() => this.confirm()))
+						.addButton((btn) => btn
+							.setButtonText('Cancel')
+							.onClick(() => {
+								this.cancelled = true;
+								this.close();
+							}));
+
+					window.requestAnimationFrame(() => {
+						this.inputEl.focus();
+						this.inputEl.select();
+					});
 				}
 
 				onClose() {
-					resolve(this.value);
+					resolve(this.cancelled ? null : this.value);
 				}
-			})(this.app, prompt, defaultValue);
+			})(this.app);
 
 			modal.open();
 		});
@@ -2230,13 +2315,23 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Obsidian Base Path')
-			.setDesc('Path to your Obsidian Base file (e.g., "RP Scenes/Roleplay Tracker.base" or "RP Scenes/Tracker.md"). Leave empty and run **Initialize MultiMuse workspace** to create `<Scenes Folder>/Roleplay Tracker.base`.')
+			.setDesc('Path to your Obsidian Base file (e.g., "RP Scenes/Roleplay Tracker.base" or "RP Scenes/Tracker.md"). Leave empty and use **Initialize workspace** below to create `<Scenes Folder>/Roleplay Tracker.base`.')
 			.addText(text => text
 				.setPlaceholder('RP Scenes/Roleplay Tracker.base')
 				.setValue(this.plugin.settings.basePath)
 				.onChange(async (value) => {
 					this.plugin.settings.basePath = value;
 					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Initialize workspace')
+			.setDesc('Create your scenes folder and tracker base from the paths above (or use **Initialize MultiMuse workspace** in the command palette).')
+			.addButton(button => button
+				.setButtonText('Initialize')
+				.setCta()
+				.onClick(() => {
+					void this.plugin.initializeMultimuseWorkspace();
 				}));
 
 		// Scene Properties Tracking

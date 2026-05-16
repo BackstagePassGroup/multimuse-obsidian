@@ -86,3 +86,5 @@ jobs:
           else
             gh release create "${ARGS[@]}"
           fi
+          # Obsidian community validation requires the release *title* to include the manifest version (not just the tag).
+          gh release edit "$VERSION" --title "$VERSION" --notes "Multimuse Tracker $VERSION"
