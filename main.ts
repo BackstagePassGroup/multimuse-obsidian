@@ -531,7 +531,7 @@ export default class MultimuseObsidian extends Plugin {
 	}
 
 	async checkAllThreadsViaBotApi(): Promise<void> {
-		/**Check all scene files against current thread_tracking state.*/
+		/**Poll tracked thread paths from the API, then active vault scenes not in the tracker map.*/
 		if (!this.settings.apiKey) {
 			return;
 		}
@@ -564,30 +564,53 @@ export default class MultimuseObsidian extends Plugin {
 
 			const trackedData = parseJson<TrackedThreadsResponse>(trackedResponse.text);
 			const trackedThreads = trackedData.threads || [];
-
-			if (trackedThreads.length === 0) {
-				return;
-			}
-
-			// Create a map of scene_path -> thread info for quick lookup.
-			const scenePathMap = new Map<string, TrackedThread>();
-			for (const thread of trackedThreads) {
-				if (thread.scene_path) {
-					scenePathMap.set(thread.scene_path, thread);
-				}
-				for (const scenePath of thread.scene_paths || []) {
-					scenePathMap.set(scenePath, thread);
-				}
-			}
-
-			// Get all scene files
-			const sceneFiles = this.getSceneFiles();
+			const scenePathMap = this.buildScenePathMap(trackedThreads);
 			let updatedCount = 0;
 
-			// Process each scene file
-			for (const file of sceneFiles) {
+			// Phase 1 (API-first): poll paths returned by threads/tracked.
+			for (const [scenePath, threadInfo] of scenePathMap) {
 				try {
-					// Skip checking if this file was recently created by the plugin
+					if (this.recentlyCreatedFiles.has(scenePath)) {
+						continue;
+					}
+
+					const abstract = this.app.vault.getAbstractFileByPath(scenePath);
+					if (!(abstract instanceof TFile) || abstract.extension !== 'md') {
+						continue;
+					}
+
+					const file = abstract;
+					const cache = this.app.metadataCache.getFileCache(file);
+					const frontmatter = this.getFrontmatter(cache);
+					if (!frontmatter || !this.isSceneMarkedActive(frontmatter)) {
+						continue;
+					}
+
+					if (this.getCharacterNames(frontmatter).length === 0) {
+						continue;
+					}
+
+					const updated = await this.queryTrackedSceneByThreadId(
+						file,
+						threadInfo.thread_id,
+						primaryUserIdStr,
+						'checkAllThreadsViaBotApi'
+					);
+					if (updated) {
+						updatedCount++;
+					}
+				} catch (error) {
+					console.error(`Error checking tracked path ${scenePath}:`, error);
+				}
+			}
+
+			// Phase 2 (orphan fallback): active vault scenes with Link not in tracker path map.
+			for (const file of this.getActiveSceneFiles()) {
+				try {
+					if (scenePathMap.has(file.path)) {
+						continue;
+					}
+
 					if (this.recentlyCreatedFiles.has(file.path)) {
 						console.log(`[MultimuseObsidian] checkAllThreadsViaBotApi: Skipping recently created file: ${file.path}`);
 						continue;
@@ -599,65 +622,22 @@ export default class MultimuseObsidian extends Plugin {
 						continue;
 					}
 
-					// Skip if scene is marked as inactive
-					const isActive = frontmatter['Is Active?'];
-					if (isActive === false || isActive === 'false') {
+					const link = frontmatter['Link'];
+					if (typeof link !== 'string') {
 						continue;
 					}
 
-					// Check if this scene is in the linked threads
-					const threadInfo = scenePathMap.get(file.path);
-					if (!threadInfo) {
-						// Scene not linked in thread_tracking, try querying by thread_id and characters.
-						const link = frontmatter['Link'];
-						if (typeof link !== 'string') continue;
+					if (this.getCharacterNames(frontmatter).length === 0) {
+						continue;
+					}
 
-						const characters = this.getCharacterNames(frontmatter);
-						if (characters.length === 0) continue;
+					if (!this.extractThreadIdFromUrl(link)) {
+						continue;
+					}
 
-						const threadId = this.extractThreadIdFromUrl(link);
-						if (!threadId) continue;
-
-						// Query this scene individually
-						const updated = await this.querySceneState(file);
-						if (updated) {
-							updatedCount++;
-						}
-					} else {
-						// Scene is linked - query its state
-						const characters = this.getCharacterNames(frontmatter);
-						if (characters.length === 0) continue;
-
-						const charactersParam = characters.join(',');
-						// Use primary user ID for query
-						const primaryUserId = await this.getPrimaryUserId();
-						if (!primaryUserId) {
-							continue;
-						}
-						const queryUrl = `${this.getBotApiUrl()}/api/v1/scenes/query?thread_id=${threadInfo.thread_id}&characters=${encodeURIComponent(charactersParam)}&user_id=${primaryUserId}`;
-
-						const queryResponse = await requestUrl({
-							url: queryUrl,
-							method: 'GET',
-							headers: this.getApiHeaders()
-						});
-
-						if (queryResponse.status === 200) {
-							const queryData = parseJson<SceneQueryResponse>(queryResponse.text);
-							
-							if (queryData.tracked && queryData.state) {
-								const state = queryData.state;
-								const updated = await this.updateSceneFromState(file, cache, state);
-								if (updated) {
-									updatedCount++;
-								}
-							}
-						} else {
-							// Log auth errors but don't spam for every scene
-							if (queryResponse.status === 401) {
-								this.handleApiError(queryResponse, 'checkAllThreadsViaBotApi - query scene');
-							}
-						}
+					const updated = await this.querySceneState(file);
+					if (updated) {
+						updatedCount++;
 					}
 				} catch (error) {
 					console.error(`Error checking ${file.path}:`, error);
@@ -670,6 +650,67 @@ export default class MultimuseObsidian extends Plugin {
 		} catch (error) {
 			console.error(`[MultimuseObsidian] Error checking all threads:`, error);
 		}
+	}
+
+	buildScenePathMap(trackedThreads: TrackedThread[]): Map<string, TrackedThread> {
+		const scenePathMap = new Map<string, TrackedThread>();
+		for (const thread of trackedThreads) {
+			if (thread.scene_path) {
+				scenePathMap.set(thread.scene_path, thread);
+			}
+			for (const scenePath of thread.scene_paths || []) {
+				scenePathMap.set(scenePath, thread);
+			}
+		}
+		return scenePathMap;
+	}
+
+	async queryTrackedSceneByThreadId(
+		file: TFile,
+		threadId: string | number,
+		userId: string,
+		errorContext: string
+	): Promise<boolean> {
+		const cache = this.app.metadataCache.getFileCache(file);
+		const frontmatter = this.getFrontmatter(cache);
+		if (!cache || !frontmatter) {
+			return false;
+		}
+
+		const characters = this.getCharacterNames(frontmatter);
+		if (characters.length === 0) {
+			return false;
+		}
+
+		const charactersParam = characters.join(',');
+		const queryUrl = `${this.getBotApiUrl()}/api/v1/scenes/query?thread_id=${threadId}&characters=${encodeURIComponent(charactersParam)}&user_id=${userId}`;
+
+		const queryResponse = await requestUrl({
+			url: queryUrl,
+			method: 'GET',
+			headers: this.getApiHeaders()
+		});
+
+		if (queryResponse.status !== 200) {
+			if (queryResponse.status === 401) {
+				this.handleApiError(queryResponse, `${errorContext} - query scene`);
+			}
+			return false;
+		}
+
+		const queryData = parseJson<SceneQueryResponse>(queryResponse.text);
+		if (!queryData.tracked || !queryData.state) {
+			return false;
+		}
+
+		const state = queryData.state;
+		const repliedValue = state.replied ?? state.is_from_character;
+		if (repliedValue === undefined || repliedValue === null) {
+			return false;
+		}
+
+		const normalizedState = { ...state, replied: repliedValue };
+		return await this.updateSceneFromState(file, cache, normalizedState);
 	}
 
 	async querySceneState(file: TFile): Promise<boolean> {
@@ -690,10 +731,8 @@ export default class MultimuseObsidian extends Plugin {
 			return false;
 		}
 
-		// Skip if scene is marked as inactive
-		const isActive = frontmatter['Is Active?'];
-		if (isActive === false || isActive === 'false') {
-			return false; // Skip inactive scenes
+		if (!this.isSceneMarkedActive(frontmatter)) {
+			return false;
 		}
 
 		const link = frontmatter['Link'];
@@ -968,6 +1007,29 @@ export default class MultimuseObsidian extends Plugin {
 		const files: TFile[] = [];
 		this.collectMarkdownFiles(folder, files);
 		return files;
+	}
+
+	/** True when the scene should be polled/synced (respects Track Is Active? setting). */
+	isSceneMarkedActive(frontmatter: FrontmatterData): boolean {
+		if (!this.settings.trackIsActive) {
+			return true;
+		}
+		const raw = frontmatter['Is Active?'];
+		return raw !== false && raw !== 'false';
+	}
+
+	/** Scene markdown files under the scenes folder with Is Active? true (or untracked when toggle is off). */
+	getActiveSceneFiles(): TFile[] {
+		const active: TFile[] = [];
+		for (const file of this.getSceneFiles()) {
+			const cache = this.app.metadataCache.getFileCache(file);
+			const frontmatter = this.getFrontmatter(cache);
+			if (!frontmatter || !this.isSceneMarkedActive(frontmatter)) {
+				continue;
+			}
+			active.push(file);
+		}
+		return active;
 	}
 
 	/** Build a map of thread_id (from Link property) -> TFile for all scene files that have a valid Link. */
@@ -1830,11 +1892,10 @@ export default class MultimuseObsidian extends Plugin {
 		 * @param context Optional context string (e.g., muse name) to display in the prompt
 		 */
 		const RP_ROOT = this.settings.scenesFolder;
-		const files = this.app.vault.getFiles();
 		const dirSet = new Set<string>();
 
-		for (const file of files) {
-			if (!file.path.startsWith(RP_ROOT + "/")) continue;
+		// Only scan the configured scenes folder (not vault.getFiles()).
+		for (const file of this.getSceneFiles()) {
 			const parts = file.path.split("/");
 			parts.pop();
 			if (parts.length >= 2) {
