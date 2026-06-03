@@ -155,8 +155,8 @@ Created: 2024-01-15
 2. Frontmatter is read to get `Link` and `Characters`
 3. Thread ID is extracted from the Discord URL
 4. If multiple characters, a selection modal appears
-5. Message is posted via the MultiMuse API
-6. Long messages are automatically split to respect Discord's limits
+5. Configured muse **headers** and **footers** (server/channel presets from `/muse header` and `/muse footer`) are resolved and prepended/appended when the message fits in one Discord post
+6. Message is posted via the MultiMuse API (long posts are split server-side; wrappers apply on the first/last chunk automatically)
 
 ### Scene Creation
 

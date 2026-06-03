@@ -93,6 +93,54 @@ interface ApiErrorBody {
 	message?: string;
 }
 
+interface MuseWrappersResolveResponse {
+	header?: string;
+	footer?: string;
+	muse_id?: string | null;
+}
+
+const DISCORD_MESSAGE_BUDGET = 2000;
+
+/** Mirrors MultiMuse core/post_wrappers.compose_chunk_for_send (single-chunk Send as Muse). */
+function composeChunkForSend(
+	chunk: string,
+	headerBody: string,
+	footerBody: string,
+	budget = DISCORD_MESSAGE_BUDGET
+): string {
+	const museHeader = headerBody || '';
+	const museFooter = footerBody || '';
+	const reserved = museHeader.length + museFooter.length;
+	const icBudget = Math.max(0, budget - reserved);
+	const icSlice = chunk ? chunk.slice(0, icBudget) : '';
+
+	const parts: string[] = [];
+	if (museHeader) {
+		parts.push(museHeader);
+	}
+	if (icSlice) {
+		if (parts.length > 0 && !parts[parts.length - 1].endsWith('\n') && !icSlice.startsWith('\n')) {
+			parts.push('\n');
+		}
+		parts.push(icSlice);
+	} else if (parts.length === 0) {
+		parts.push('');
+	}
+	if (museFooter) {
+		const bodySoFar = parts.join('');
+		if (bodySoFar && !bodySoFar.endsWith('\n')) {
+			parts.push('\n');
+		}
+		parts.push(museFooter);
+	}
+	return parts.join('');
+}
+
+function canPreapplyWrappers(ic: string, header: string, footer: string): boolean {
+	const composed = composeChunkForSend(ic, header, footer);
+	return composed.length <= DISCORD_MESSAGE_BUDGET;
+}
+
 function parseJson<T>(text: string): T {
 	return JSON.parse(text) as T;
 }
@@ -116,6 +164,13 @@ function frontmatterValueToString(value: unknown, fallback = ''): string {
 export default class MultimuseObsidian extends Plugin {
 	settings: MultimuseObsidianSettings;
 	pollIntervalId: number | null = null;
+	/** Bumped to cancel an in-flight poll when the user posts as muse (frees API for POST). */
+	pollGeneration = 0;
+	isPollRunning = false;
+	/** Resolves when the current poll batch finishes (Send as Muse awaits this). */
+	pollRunPromise: Promise<void> | null = null;
+	/** Serializes poll GETs so they do not stack many concurrent calls to the API host. */
+	private pollGetChain: Promise<void> = Promise.resolve();
 	museCache: Map<string, MuseInfo[]> = new Map(); // user_id (as string) -> muses
 	recentlyCreatedFiles: Set<string> = new Set(); // Track recently created files to skip immediate checking
 	// Cache of last-seen "Is Active?" value per scene path so we only sync when the user actually toggles it.
@@ -132,15 +187,14 @@ export default class MultimuseObsidian extends Plugin {
 		// Add settings tab
 		this.addSettingTab(new MultimuseObsidianSettingTab(this.app, this));
 
-		// Sync muses on startup (auto-fetch user ID from API key)
+		// Warm auth + muse cache in background so onload does not block the editor
 		if (this.settings.apiKey) {
-			await this.getUserIdFromApiKey(); // Cache user ID
-			await this.syncMuses();
+			void this.getUserIdFromApiKey().then(() => void this.syncMuses());
 		}
 
-		// Start polling if enabled
+		// Start polling if enabled (first poll deferred so startup stays responsive)
 		if (this.settings.enabled && this.settings.apiKey) {
-			this.startPolling();
+			this.startPolling({ deferInitialCheck: true });
 		}
 
 		// Add command to manually check now
@@ -295,21 +349,49 @@ export default class MultimuseObsidian extends Plugin {
 		await this.saveData(this.settings);
 	}
 
-	startPolling() {
-		this.stopPolling(); // Clear any existing interval
-		
-		if (!this.settings.ownerId) {
-			new Notice('Discord user ID not configured. Please set it in settings.');
-			return;
-		}
+	startPolling(opts?: { deferInitialCheck?: boolean }) {
+		this.stopPolling();
 
 		const intervalMs = this.settings.pollInterval * 60 * 1000;
 		this.pollIntervalId = window.setInterval(() => {
 			void this.checkAllThreads();
 		}, intervalMs);
 
-		// Do an initial check
-		void this.checkAllThreads();
+		if (!opts?.deferInitialCheck) {
+			void this.checkAllThreads();
+		} else {
+			window.setTimeout((): void => {
+				void this.checkAllThreads();
+			}, 45_000);
+		}
+	}
+
+	/** Serialize background GETs; POST waits for pollRunPromise then uses fast delivery. */
+	private enqueuePollGet<T>(fn: () => Promise<T>): Promise<T> {
+		const run = this.pollGetChain.then(() => fn());
+		this.pollGetChain = run.then((): void => undefined, (): void => undefined);
+		return run;
+	}
+
+	private async waitForPollToFinish(): Promise<void> {
+		this.pollGeneration++;
+		if (this.pollRunPromise) {
+			await this.pollRunPromise;
+		}
+	}
+
+	private async apiPostJson(
+		path: string,
+		body: Record<string, unknown>
+	): Promise<RequestUrlResponse> {
+		await this.waitForPollToFinish();
+		return await requestUrl({
+			url: `${this.getBotApiUrl()}${path}`,
+			method: 'POST',
+			headers: this.getApiHeaders(),
+			body: JSON.stringify({ ...body, fast: true }),
+			throw: false
+		});
 	}
 
 	stopPolling() {
@@ -475,6 +557,97 @@ export default class MultimuseObsidian extends Plugin {
 		return await this.getUserIdFromApiKey();
 	}
 
+	/**
+	 * Fetch muse list for user IDs. Uses in-memory cache when available unless forceRefresh.
+	 * backgroundRefresh: return cache immediately and syncMuses() in the background.
+	 */
+	async getMusesForUserIds(
+		userIds: string[],
+		opts?: { forceRefresh?: boolean; backgroundRefresh?: boolean }
+	): Promise<MuseInfo[]> {
+		const primaryId = userIds[0];
+		const cached = primaryId ? this.museCache.get(primaryId) : undefined;
+		if (!opts?.forceRefresh && cached && cached.length > 0) {
+			if (opts?.backgroundRefresh) {
+				void this.syncMuses();
+			}
+			return cached;
+		}
+		return this.fetchMusesListFromApi(userIds);
+	}
+
+	findMuseMatch(muses: MuseInfo[], selectedMuse: string): MuseInfo | undefined {
+		const selectedLower = selectedMuse.toLowerCase().trim();
+		return muses.find(m => {
+			const museLower = m.name.toLowerCase().trim();
+			return museLower === selectedLower
+				|| museLower.includes(selectedLower)
+				|| selectedLower.includes(museLower);
+		});
+	}
+
+	async resolveMuseWrappers(
+		threadId: string,
+		userId: string,
+		muse: MuseInfo,
+		museName: string
+	): Promise<{ header: string; footer: string }> {
+		const params = new URLSearchParams({
+			thread_id: threadId,
+			user_id: userId,
+		});
+		if (muse.muse_id) {
+			params.set('muse_id', muse.muse_id);
+		}
+		if (museName) {
+			params.set('muse_name', museName);
+		}
+		try {
+			const response = await requestUrl({
+				url: `${this.getBotApiUrl()}/api/v1/muses/wrappers/resolve?${params.toString()}`,
+				method: 'GET',
+				headers: this.getApiHeaders(),
+				throw: false,
+			});
+			if (response.status !== 200) {
+				return { header: '', footer: '' };
+			}
+			const data = parseJson<MuseWrappersResolveResponse>(response.text);
+			return {
+				header: (data.header || '').trim() ? data.header! : '',
+				footer: (data.footer || '').trim() ? data.footer! : '',
+			};
+		} catch (error) {
+			console.debug('[MultimuseObsidian] resolveMuseWrappers:', error);
+			return { header: '', footer: '' };
+		}
+	}
+
+	async fetchMusesListFromApi(userIds: string[]): Promise<MuseInfo[]> {
+		if (!this.settings.apiKey || userIds.length === 0) {
+			return [];
+		}
+		const queryParam = `user_ids=${userIds.join(',')}`;
+		const url = `${this.getBotApiUrl()}/api/v1/muses/list?${queryParam}`;
+		const response = await requestUrl({
+			url: url,
+			method: 'GET',
+			headers: this.getApiHeaders()
+		});
+		if (response.status !== 200) {
+			if (!this.handleApiError(response, 'fetchMusesListFromApi')) {
+				console.error(`Failed to fetch muses: ${response.status} - ${response.text}`);
+			}
+			return [];
+		}
+		const data = parseJson<MusesListResponse>(response.text);
+		const muses: MuseInfo[] = data.muses || [];
+		for (const userId of userIds) {
+			this.museCache.set(String(userId), muses);
+		}
+		return muses;
+	}
+
 	async syncMuses(): Promise<void> {
 		/**Sync muse names from bot API for all configured user IDs.*/
 		if (!this.settings.apiKey) {
@@ -482,40 +655,14 @@ export default class MultimuseObsidian extends Plugin {
 		}
 
 		try {
-			// Collect all user IDs (deduplicated) - now from API key
 			const userIds = await this.getAllUserIds();
 			if (userIds.length === 0) {
 				return;
 			}
 
-			// Build query string - always use user_ids parameter for consistency
-			const queryParam = `user_ids=${userIds.join(',')}`;
-
-			const url = `${this.getBotApiUrl()}/api/v1/muses/list?${queryParam}`;
-
-			const response = await requestUrl({
-				url: url,
-				method: 'GET',
-				headers: this.getApiHeaders()
-			});
-
-			if (response.status === 200) {
-				const data = parseJson<MusesListResponse>(response.text);
-				const muses: MuseInfo[] = data.muses || [];
-				
-				// Cache all muses for each user ID (API already returns all accessible muses for all provided user IDs)
-				// Since the API returns muses that are either owned by or shared with any of the user IDs,
-				// we cache all of them for each user ID so they're available when needed
-				// Keep user IDs as strings to avoid precision loss with large Discord IDs
-				for (const userId of userIds) {
-					this.museCache.set(String(userId), muses);
-				}
-				
+			const muses = await this.fetchMusesListFromApi(userIds);
+			if (muses.length > 0) {
 				console.log(`[MultimuseObsidian] Synced ${muses.length} muse(s) for ${userIds.length} user(s)`);
-			} else {
-				if (!this.handleApiError(response, 'syncMuses')) {
-					console.error(`Failed to sync muses: ${response.status} - ${response.text}`);
-				}
 			}
 		} catch (error) {
 			console.error('Error syncing muses:', error);
@@ -527,7 +674,15 @@ export default class MultimuseObsidian extends Plugin {
 			return;
 		}
 
-		await this.checkAllThreadsViaBotApi();
+		const run = this.checkAllThreadsViaBotApi();
+		this.pollRunPromise = run;
+		try {
+			await run;
+		} finally {
+			if (this.pollRunPromise === run) {
+				this.pollRunPromise = null;
+			}
+		}
 	}
 
 	async checkAllThreadsViaBotApi(): Promise<void> {
@@ -535,6 +690,9 @@ export default class MultimuseObsidian extends Plugin {
 		if (!this.settings.apiKey) {
 			return;
 		}
+
+		const generation = this.pollGeneration;
+		this.isPollRunning = true;
 
 		try {
 			// Get primary user ID for linked scenes query
@@ -549,11 +707,12 @@ export default class MultimuseObsidian extends Plugin {
 
 			// Get all Discord-side tracked threads from the current API.
 			const trackedUrl = `${this.getBotApiUrl()}/api/v1/threads/tracked?user_id=${primaryUserId}`;
-			const trackedResponse = await requestUrl({
+			const trackedResponse = await this.enqueuePollGet(() => requestUrl({
 				url: trackedUrl,
 				method: 'GET',
-				headers: this.getApiHeaders()
-			});
+				headers: this.getApiHeaders(),
+				throw: false
+			}));
 
 			if (trackedResponse.status !== 200) {
 				if (!this.handleApiError(trackedResponse, 'checkAllThreadsViaBotApi')) {
@@ -567,8 +726,11 @@ export default class MultimuseObsidian extends Plugin {
 			const scenePathMap = this.buildScenePathMap(trackedThreads);
 			let updatedCount = 0;
 
-			// Phase 1 (API-first): poll paths returned by threads/tracked.
+			// Phase 1 (API-first): one scene at a time so Send as Muse can jump the queue sooner.
 			for (const [scenePath, threadInfo] of scenePathMap) {
+				if (generation !== this.pollGeneration) {
+					break;
+				}
 				try {
 					if (this.recentlyCreatedFiles.has(scenePath)) {
 						continue;
@@ -605,42 +767,47 @@ export default class MultimuseObsidian extends Plugin {
 			}
 
 			// Phase 2 (orphan fallback): active vault scenes with Link not in tracker path map.
-			for (const file of this.getActiveSceneFiles()) {
-				try {
-					if (scenePathMap.has(file.path)) {
-						continue;
+			if (generation === this.pollGeneration) {
+				for (const file of this.getActiveSceneFiles()) {
+					if (generation !== this.pollGeneration) {
+						break;
 					}
+					try {
+						if (scenePathMap.has(file.path)) {
+							continue;
+						}
 
-					if (this.recentlyCreatedFiles.has(file.path)) {
-						console.log(`[MultimuseObsidian] checkAllThreadsViaBotApi: Skipping recently created file: ${file.path}`);
-						continue;
-					}
+						if (this.recentlyCreatedFiles.has(file.path)) {
+							console.log(`[MultimuseObsidian] checkAllThreadsViaBotApi: Skipping recently created file: ${file.path}`);
+							continue;
+						}
 
-					const cache = this.app.metadataCache.getFileCache(file);
-					const frontmatter = this.getFrontmatter(cache);
-					if (!frontmatter) {
-						continue;
-					}
+						const cache = this.app.metadataCache.getFileCache(file);
+						const frontmatter = this.getFrontmatter(cache);
+						if (!frontmatter) {
+							continue;
+						}
 
-					const link = frontmatter['Link'];
-					if (typeof link !== 'string') {
-						continue;
-					}
+						const link = frontmatter['Link'];
+						if (typeof link !== 'string') {
+							continue;
+						}
 
-					if (this.getCharacterNames(frontmatter).length === 0) {
-						continue;
-					}
+						if (this.getCharacterNames(frontmatter).length === 0) {
+							continue;
+						}
 
-					if (!this.extractThreadIdFromUrl(link)) {
-						continue;
-					}
+						if (!this.extractThreadIdFromUrl(link)) {
+							continue;
+						}
 
-					const updated = await this.querySceneState(file);
-					if (updated) {
-						updatedCount++;
+						const updated = await this.querySceneState(file);
+						if (updated) {
+							updatedCount++;
+						}
+					} catch (error) {
+						console.error(`Error checking ${file.path}:`, error);
 					}
-				} catch (error) {
-					console.error(`Error checking ${file.path}:`, error);
 				}
 			}
 
@@ -649,6 +816,10 @@ export default class MultimuseObsidian extends Plugin {
 			}
 		} catch (error) {
 			console.error(`[MultimuseObsidian] Error checking all threads:`, error);
+		} finally {
+			if (generation === this.pollGeneration) {
+				this.isPollRunning = false;
+			}
 		}
 	}
 
@@ -685,11 +856,12 @@ export default class MultimuseObsidian extends Plugin {
 		const charactersParam = characters.join(',');
 		const queryUrl = `${this.getBotApiUrl()}/api/v1/scenes/query?thread_id=${threadId}&characters=${encodeURIComponent(charactersParam)}&user_id=${userId}`;
 
-		const queryResponse = await requestUrl({
+		const queryResponse = await this.enqueuePollGet(() => requestUrl({
 			url: queryUrl,
 			method: 'GET',
-			headers: this.getApiHeaders()
-		});
+			headers: this.getApiHeaders(),
+			throw: false
+		}));
 
 		if (queryResponse.status !== 200) {
 			if (queryResponse.status === 401) {
@@ -760,11 +932,12 @@ export default class MultimuseObsidian extends Plugin {
 			}
 			const url = `${this.getBotApiUrl()}/api/v1/scenes/query?thread_id=${threadId}&characters=${encodeURIComponent(charactersParam)}&user_id=${primaryUserId}`;
 
-			const response = await requestUrl({
+			const response = await this.enqueuePollGet(() => requestUrl({
 				url: url,
 				method: 'GET',
-				headers: this.getApiHeaders()
-			});
+				headers: this.getApiHeaders(),
+				throw: false
+			}));
 
 			if (response.status !== 200) {
 				if (!this.handleApiError(response, `querySceneState for ${file.path}`)) {
@@ -2210,104 +2383,107 @@ export default class MultimuseObsidian extends Plugin {
 			return;
 		}
 
-		// Get primary user ID
-		const primaryUserId = await this.getPrimaryUserId();
-		if (!primaryUserId) {
-			new Notice('Failed to get user ID from API key. Please check your API key in settings.');
-			return;
-		}
-
 		// Select muse if multiple characters
 		let selectedMuse: string;
 		if (characters.length === 1) {
 			selectedMuse = characters[0];
 		} else {
-			// Show modal to select muse
 			const museIndex = await this.showSuggester(characters, characters);
 			if (museIndex === null || museIndex < 0) {
-				return; // User cancelled
+				return;
 			}
 			selectedMuse = characters[museIndex];
 		}
 
-		// Verify muse exists and is accessible
-		const userIds = await this.getAllUserIds();
-		if (userIds.length === 0) {
+		new Notice(`Sending as ${selectedMuse}…`);
+
+		const primaryUserId = this.settings.cachedUserId || await this.getPrimaryUserId();
+		if (!primaryUserId) {
 			new Notice('Failed to get user ID from API key. Please check your API key in settings.');
 			return;
 		}
 
-		// Get muses to verify the selected muse is available
-		let muses: MuseInfo[] = [];
-		try {
-			const queryParam = `user_ids=${userIds.join(',')}`;
-			const url = `${this.getBotApiUrl()}/api/v1/muses/list?${queryParam}`;
-			const response = await requestUrl({
-				url: url,
-				method: 'GET',
-				headers: this.getApiHeaders()
-			});
-
-			if (response.status === 200) {
-				const data = parseJson<MusesListResponse>(response.text);
-				muses = data.muses || [];
-			} else {
-				if (!this.handleApiError(response, 'sendSelectionAsMuse - fetch muses')) {
-					new Notice(`Failed to fetch muses: ${response.status}`);
-				}
-				return;
-			}
-		} catch (error) {
-			console.error('Error fetching muses:', error);
-			new Notice('Failed to fetch muses from bot API. Check your API URL and connection.');
-			return;
+		let muses = this.museCache.get(primaryUserId) ?? [];
+		let matchedMuse = this.findMuseMatch(muses, selectedMuse);
+		if (!matchedMuse?.muse_id) {
+			muses = await this.getMusesForUserIds([primaryUserId], { forceRefresh: true });
+			matchedMuse = this.findMuseMatch(muses, selectedMuse);
 		}
 
-		// Find matching muse (case-insensitive fuzzy) for validation and optional muse_id
-		const matchedMuse = muses.find(m => {
-			const museLower = m.name.toLowerCase().trim();
-			const selectedLower = selectedMuse.toLowerCase().trim();
-			return museLower === selectedLower || museLower.includes(selectedLower) || selectedLower.includes(museLower);
-		});
-
-		if (!matchedMuse) {
-			new Notice(`Muse "${selectedMuse}" not found or not accessible. Available muses: ${muses.map(m => m.name).join(', ')}`);
-			return;
-		}
-
-		// Build post body: use muse_id when available (alias-safe), keep muse_name for display/fallback
+		const icContent = selection.trim();
 		const postBody: Record<string, unknown> = {
 			thread_id: threadId,
 			muse_name: selectedMuse,
-			content: selection.trim(),
-			user_id: primaryUserId
+			content: icContent,
+			user_id: primaryUserId,
 		};
-		if (matchedMuse.muse_id) {
+		if (matchedMuse?.muse_id) {
 			postBody.muse_id = matchedMuse.muse_id;
 		}
 
-		// Post message via API
-		try {
-			const url = `${this.getBotApiUrl()}/api/v1/messages/post`;
-			const response = await requestUrl({
-				url: url,
-				method: 'POST',
-				headers: this.getApiHeaders(),
-				body: JSON.stringify(postBody)
-			});
+		if (matchedMuse) {
+			const { header, footer } = await this.resolveMuseWrappers(
+				threadId,
+				primaryUserId,
+				matchedMuse,
+				selectedMuse
+			);
+			if ((header || footer) && canPreapplyWrappers(icContent, header, footer)) {
+				postBody.content = composeChunkForSend(icContent, header, footer);
+				postBody.wrappers_preapplied = true;
+			}
+		}
 
-			if (response.status === 200) {
-				new Notice(`Message sent as ${selectedMuse}!`);
-			} else {
-				if (!this.handleApiError(response, 'sendSelectionAsMuse - post message')) {
-					const errorData = parseJson<ApiErrorBody>(response.text);
-					new Notice(`Failed to send message: ${errorData.message || response.status}`);
+		// Return immediately; delivery runs in background (fast API accepts with 202).
+		void this.deliverPostAsMuse(selectedMuse, primaryUserId, postBody, !matchedMuse);
+	}
+
+	private async deliverPostAsMuse(
+		selectedMuse: string,
+		primaryUserId: string,
+		postBody: Record<string, unknown>,
+		retryOn403: boolean
+	): Promise<void> {
+		try {
+			let response = await this.apiPostJson('/api/v1/messages/post', postBody);
+
+			if (response.status === 403 && retryOn403) {
+				const muses = await this.getMusesForUserIds([primaryUserId], { forceRefresh: true });
+				const matchedMuse = this.findMuseMatch(muses, selectedMuse);
+				if (matchedMuse) {
+					if (matchedMuse.muse_id) {
+						postBody.muse_id = matchedMuse.muse_id;
+					}
+					const icRaw = typeof postBody.content === 'string' ? postBody.content : '';
+					if (!postBody.wrappers_preapplied) {
+						const { header, footer } = await this.resolveMuseWrappers(
+							String(postBody.thread_id),
+							primaryUserId,
+							matchedMuse,
+							selectedMuse
+						);
+						if ((header || footer) && canPreapplyWrappers(icRaw, header, footer)) {
+							postBody.content = composeChunkForSend(icRaw, header, footer);
+							postBody.wrappers_preapplied = true;
+						}
+					}
+					response = await this.apiPostJson('/api/v1/messages/post', postBody);
+				} else if (muses.length > 0) {
+					new Notice(`Muse "${selectedMuse}" not found. Available: ${muses.map(m => m.name).join(', ')}`);
+					return;
 				}
+			}
+
+			if (response.status === 200 || response.status === 202) {
+				new Notice(`Message sent as ${selectedMuse}!`);
+				void this.syncMuses();
+			} else if (!this.handleApiError(response, 'sendSelectionAsMuse - post message')) {
+				const errorData = parseJson<ApiErrorBody>(response.text);
+				new Notice(`Failed to send message: ${errorData.message || response.status}`);
 			}
 		} catch (error) {
 			console.error('Error sending message:', error);
-			const errorMessage = getErrorMessage(error);
-			new Notice(`Failed to send message: ${errorMessage}`);
+			new Notice(`Failed to send message: ${getErrorMessage(error)}`);
 		}
 	}
 }
