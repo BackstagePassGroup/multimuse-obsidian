@@ -12,6 +12,8 @@ interface MultimuseObsidianSettings {
 	cachedUserId: string; // Cached user ID from API key (auto-populated)
 	trackRoleplay: boolean; // Whether to add Roleplay property from folder path
 	trackIsActive: boolean; // Whether to add Is Active? property (defaulting to true)
+	/** When enabled, Characters + Participants frontmatter push to the API (keyed by Link thread id). */
+	obsidianSourceOfTruth: boolean;
 }
 
 /** Canonical API base URL (no trailing slash). Old IP:port configs are migrated to this on load. */
@@ -28,7 +30,8 @@ const DEFAULT_SETTINGS: MultimuseObsidianSettings = {
 	apiKey: '',
 	cachedUserId: '', // Auto-populated from API key
 	trackRoleplay: true, // Default: extract Roleplay from folder path
-	trackIsActive: true // Default: add Is Active? property
+	trackIsActive: true, // Default: add Is Active? property
+	obsidianSourceOfTruth: false,
 };
 
 interface MuseInfo {
@@ -104,6 +107,12 @@ const DISCORD_MESSAGE_BUDGET = 2000;
 const POLL_YIELD_MS = 600;
 /** Debounce vault modify/create handlers so autosave does not stack scene API calls. */
 const SCENE_CHANGE_DEBOUNCE_MS = 2500;
+/** Longer debounce when pushing metadata as source of truth (reduces Discord-side work). */
+const SCENE_METADATA_DEBOUNCE_MS = 8000;
+/** Minimum gap between scenes/query polls for the same file (avoids Discord history scans). */
+const SCENE_QUERY_COOLDOWN_MS = 45000;
+/** Pause between scenes during batch poll. */
+const POLL_SCENE_DELAY_MS = 500;
 
 /** Mirrors MultiMuse core/post_wrappers.compose_chunk_for_send (single-chunk Send as Muse). */
 function composeChunkForSend(
@@ -165,6 +174,18 @@ function frontmatterValueToString(value: unknown, fallback = ''): string {
 	return fallback;
 }
 
+function sortNamesAlphabetically(names: string[]): string[] {
+	return [...names].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+}
+
+function sortMusesAlphabetically(muses: MuseInfo[]): MuseInfo[] {
+	return [...muses].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+}
+
+function metadataFingerprint(characters: string[], participants: number): string {
+	return `${sortNamesAlphabetically(characters).join('\x1f')}|${participants}`;
+}
+
 export default class MultimuseObsidian extends Plugin {
 	settings: MultimuseObsidianSettings;
 	pollIntervalId: number | null = null;
@@ -177,11 +198,15 @@ export default class MultimuseObsidian extends Plugin {
 	private pollGetChain: Promise<void> = Promise.resolve();
 	/** Per-path debounce timers for vault scene modify/create (avoids API pile-up while editing). */
 	private sceneChangeDebounceTimers = new Map<string, number>();
+	/** Per-path cooldown: last scenes/query time (reduces Discord API load on the bot). */
+	private sceneQueryCooldownUntil = new Map<string, number>();
 	museCache: Map<string, MuseInfo[]> = new Map(); // user_id (as string) -> muses
 	recentlyCreatedFiles: Set<string> = new Set(); // Track recently created files to skip immediate checking
 	// Cache of last-seen "Is Active?" value per scene path so we only sync when the user actually toggles it.
 	// This prevents Obsidian from resurrecting scenes that StageHand or the bot have already ended/removed.
 	sceneActiveCache: Map<string, boolean> = new Map();
+	/** Last Characters+Participants fingerprint pushed per scene path (avoids API spam). */
+	sceneMetadataSyncCache: Map<string, string> = new Map();
 	/** True while the Create New Scene UI flow is running (blocks vault handlers from touching other notes). */
 	sceneCreationInProgress = false;
 	/** Swallows Enter between wizard modals so it cannot reach the editor. */
@@ -208,7 +233,7 @@ export default class MultimuseObsidian extends Plugin {
 			id: 'check-discord-threads',
 			name: 'Check Discord Threads Now',
 			callback: () => {
-				void this.checkAllThreads();
+				void this.checkAllThreads({ force: true });
 			}
 		});
 
@@ -244,15 +269,6 @@ export default class MultimuseObsidian extends Plugin {
 				void this.createNewScene();
 			});
 		}
-
-		// Add command to sync from tracker
-		this.addCommand({
-			id: 'sync-from-tracker',
-			name: 'Sync from Tracker',
-			callback: () => {
-				void this.syncFromTracker();
-			}
-		});
 
 		// First-time vault layout: scenes folder + Base (.base or .md) from settings
 		this.addCommand({
@@ -432,6 +448,10 @@ export default class MultimuseObsidian extends Plugin {
 		return base.replace(/\/+$/, ''); // no trailing slash
 	}
 
+	private sleep(ms: number): Promise<void> {
+		return new Promise((resolve) => window.setTimeout(resolve, ms));
+	}
+
 	/**
 	 * Get headers for API requests, including Authorization header if API key is set.
 	 * @returns Headers object for requestUrl
@@ -449,6 +469,38 @@ export default class MultimuseObsidian extends Plugin {
 		return headers;
 	}
 
+	async registerScene(params: {
+		threadId: string;
+		userId: string;
+		scenePath: string;
+		characters: string[];
+		participants: number;
+		guildId?: string | null;
+		isActive?: boolean;
+	}): Promise<RequestUrlResponse> {
+		const characters = sortNamesAlphabetically(params.characters);
+		const body: Record<string, unknown> = {
+			thread_id: params.threadId,
+			user_id: params.userId,
+			scene_path: params.scenePath,
+			characters,
+			participants: params.participants,
+			is_active: params.isActive !== false,
+		};
+		if (params.guildId) {
+			body.guild_id = params.guildId;
+		}
+
+		return await requestUrl({
+			url: `${this.getBotApiUrl()}/api/v1/scenes/create`,
+			method: 'POST',
+			headers: this.getApiHeaders(),
+			body: JSON.stringify(body),
+			throw: false,
+		});
+	}
+
+	/** @deprecated Use registerScene — kept as alias for internal callers migrating off threads/track-only flows. */
 	async trackThread(params: {
 		threadId: string;
 		userId: string;
@@ -458,21 +510,30 @@ export default class MultimuseObsidian extends Plugin {
 		guildId?: string | null;
 		characters?: string[];
 	}): Promise<RequestUrlResponse> {
-		const body: Record<string, unknown> = {
-			thread_id: params.threadId,
-			user_id: params.userId,
-			muse_name: params.museName,
-			participants: params.participants
-		};
-		if (params.scenePath) body.scene_path = params.scenePath;
-		if (params.guildId) body.guild_id = params.guildId;
-		if (params.characters && params.characters.length > 0) body.characters = params.characters;
+		if (!params.scenePath) {
+			const body: Record<string, unknown> = {
+				thread_id: params.threadId,
+				user_id: params.userId,
+				muse_name: params.museName,
+				participants: params.participants,
+			};
+			if (params.guildId) body.guild_id = params.guildId;
+			return await requestUrl({
+				url: `${this.getBotApiUrl()}/api/v1/threads/track`,
+				method: 'POST',
+				headers: this.getApiHeaders(),
+				body: JSON.stringify(body),
+				throw: false,
+			});
+		}
 
-		return await requestUrl({
-			url: `${this.getBotApiUrl()}/api/v1/threads/track`,
-			method: 'POST',
-			headers: this.getApiHeaders(),
-			body: JSON.stringify(body)
+		return this.registerScene({
+			threadId: params.threadId,
+			userId: params.userId,
+			scenePath: params.scenePath,
+			characters: params.characters?.length ? params.characters : [params.museName],
+			participants: params.participants,
+			guildId: params.guildId,
 		});
 	}
 
@@ -661,7 +722,7 @@ export default class MultimuseObsidian extends Plugin {
 			return [];
 		}
 		const data = parseJson<MusesListResponse>(response.text);
-		const muses: MuseInfo[] = data.muses || [];
+		const muses: MuseInfo[] = sortMusesAlphabetically(data.muses || []);
 		for (const userId of userIds) {
 			this.museCache.set(String(userId), muses);
 		}
@@ -689,12 +750,12 @@ export default class MultimuseObsidian extends Plugin {
 		}
 	}
 
-	async checkAllThreads() {
+	async checkAllThreads(opts?: { force?: boolean }) {
 		if (!this.settings.enabled || !this.settings.apiKey) {
 			return;
 		}
 
-		const run = this.checkAllThreadsViaBotApi();
+		const run = this.checkAllThreadsViaBotApi(opts);
 		this.pollRunPromise = run;
 		try {
 			await run;
@@ -705,7 +766,7 @@ export default class MultimuseObsidian extends Plugin {
 		}
 	}
 
-	async checkAllThreadsViaBotApi(): Promise<void> {
+	async checkAllThreadsViaBotApi(opts?: { force?: boolean }): Promise<void> {
 		/**Poll tracked thread paths from the API, then active vault scenes not in the tracker map.*/
 		if (!this.settings.apiKey) {
 			return;
@@ -776,11 +837,16 @@ export default class MultimuseObsidian extends Plugin {
 						file,
 						threadInfo.thread_id,
 						primaryUserIdStr,
-						'checkAllThreadsViaBotApi'
+						'checkAllThreadsViaBotApi',
+						opts
 					);
 					if (updated) {
 						updatedCount++;
 					}
+					if (generation !== this.pollGeneration) {
+						break;
+					}
+					await this.sleep(POLL_SCENE_DELAY_MS);
 				} catch (error) {
 					console.error(`Error checking tracked path ${scenePath}:`, error);
 				}
@@ -821,10 +887,14 @@ export default class MultimuseObsidian extends Plugin {
 							continue;
 						}
 
-						const updated = await this.querySceneState(file);
+						const updated = await this.querySceneState(file, opts);
 						if (updated) {
 							updatedCount++;
 						}
+						if (generation !== this.pollGeneration) {
+							break;
+						}
+						await this.sleep(POLL_SCENE_DELAY_MS);
 					} catch (error) {
 						console.error(`Error checking ${file.path}:`, error);
 					}
@@ -860,21 +930,32 @@ export default class MultimuseObsidian extends Plugin {
 		file: TFile,
 		threadId: string | number,
 		userId: string,
-		errorContext: string
+		errorContext: string,
+		opts?: { force?: boolean }
 	): Promise<boolean> {
+		if (!opts?.force) {
+			const now = Date.now();
+			const cooldownUntil = this.sceneQueryCooldownUntil.get(file.path) ?? 0;
+			if (now < cooldownUntil) {
+				return false;
+			}
+			this.sceneQueryCooldownUntil.set(file.path, now + SCENE_QUERY_COOLDOWN_MS);
+		}
+
 		const cache = this.app.metadataCache.getFileCache(file);
 		const frontmatter = this.getFrontmatter(cache);
 		if (!cache || !frontmatter) {
 			return false;
 		}
 
-		const characters = this.getCharacterNames(frontmatter);
+		const characters = this.getSortedCharacterNames(frontmatter);
 		if (characters.length === 0) {
 			return false;
 		}
 
 		const charactersParam = characters.join(',');
-		const queryUrl = `${this.getBotApiUrl()}/api/v1/scenes/query?thread_id=${threadId}&characters=${encodeURIComponent(charactersParam)}&user_id=${userId}`;
+		const participants = this.parseParticipantsFromFrontmatter(frontmatter);
+		const queryUrl = `${this.getBotApiUrl()}/api/v1/scenes/query?thread_id=${threadId}&characters=${encodeURIComponent(charactersParam)}&user_id=${userId}&participants=${participants}`;
 
 		const queryResponse = await this.enqueuePollGet(() => requestUrl({
 			url: queryUrl,
@@ -905,10 +986,19 @@ export default class MultimuseObsidian extends Plugin {
 		return await this.updateSceneFromState(file, cache, normalizedState);
 	}
 
-	async querySceneState(file: TFile): Promise<boolean> {
+	async querySceneState(file: TFile, opts?: { force?: boolean; skipMetadataSync?: boolean }): Promise<boolean> {
 		/**Query the tracker API for a specific scene's state and update frontmatter.*/
 		if (this.sceneCreationInProgress) {
 			return false;
+		}
+
+		if (!opts?.force) {
+			const now = Date.now();
+			const cooldownUntil = this.sceneQueryCooldownUntil.get(file.path) ?? 0;
+			if (now < cooldownUntil) {
+				return false;
+			}
+			this.sceneQueryCooldownUntil.set(file.path, now + SCENE_QUERY_COOLDOWN_MS);
 		}
 
 		// Skip checking if this file was recently created by the plugin
@@ -932,7 +1022,7 @@ export default class MultimuseObsidian extends Plugin {
 			return false;
 		}
 
-		const characters = this.getCharacterNames(frontmatter);
+		const characters = this.getSortedCharacterNames(frontmatter);
 		if (characters.length === 0) {
 			return false;
 		}
@@ -942,15 +1032,18 @@ export default class MultimuseObsidian extends Plugin {
 			return false;
 		}
 
+		if (this.settings.obsidianSourceOfTruth && !opts?.skipMetadataSync) {
+			await this.syncSceneMetadataToApi(file, { frontmatter });
+		}
+
 		try {
-			// Query the tracker API for this specific scene
 			const charactersParam = characters.join(',');
 			// Use primary user ID for query
 			const primaryUserId = await this.getPrimaryUserId();
 			if (!primaryUserId) {
 				return false;
 			}
-			const url = `${this.getBotApiUrl()}/api/v1/scenes/query?thread_id=${threadId}&characters=${encodeURIComponent(charactersParam)}&user_id=${primaryUserId}`;
+			const url = `${this.getBotApiUrl()}/api/v1/scenes/query?thread_id=${threadId}&characters=${encodeURIComponent(charactersParam)}&user_id=${primaryUserId}&participants=${this.parseParticipantsFromFrontmatter(frontmatter)}`;
 
 			const response = await this.enqueuePollGet(() => requestUrl({
 				url: url,
@@ -967,6 +1060,25 @@ export default class MultimuseObsidian extends Plugin {
 			}
 
 			const data = parseJson<SceneQueryResponse>(response.text);
+
+			if ((!data.tracked || !data.state) && this.settings.obsidianSourceOfTruth && !opts?.skipMetadataSync) {
+				await this.syncSceneMetadataToApi(file, { frontmatter });
+				const retryResponse = await this.enqueuePollGet(() => requestUrl({
+					url: url,
+					method: 'GET',
+					headers: this.getApiHeaders(),
+					throw: false,
+				}));
+				if (retryResponse.status === 200) {
+					const retryData = parseJson<SceneQueryResponse>(retryResponse.text);
+					if (retryData.tracked && retryData.state) {
+						const retryReplied = retryData.state.replied ?? retryData.state.is_from_character;
+						if (retryReplied !== undefined && retryReplied !== null) {
+							return await this.updateSceneFromState(file, cache, { ...retryData.state, replied: retryReplied });
+						}
+					}
+				}
+			}
 			
 			// If scene is not tracked, don't update anything
 			if (!data.tracked || !data.state) {
@@ -1066,22 +1178,50 @@ export default class MultimuseObsidian extends Plugin {
 			window.clearTimeout(existing);
 		}
 
+		const debounceMs = this.settings.obsidianSourceOfTruth
+			? SCENE_METADATA_DEBOUNCE_MS
+			: SCENE_CHANGE_DEBOUNCE_MS;
+
 		const timerId = window.setTimeout(() => {
 			this.sceneChangeDebounceTimers.delete(file.path);
 			void this.processSceneFileChange(file);
-		}, SCENE_CHANGE_DEBOUNCE_MS);
+		}, debounceMs);
 		this.sceneChangeDebounceTimers.set(file.path, timerId);
 	}
 
 	private async processSceneFileChange(file: TFile): Promise<void> {
 		const cache = this.app.metadataCache.getFileCache(file);
-		if (this.getFrontmatter(cache)) {
-			await this.syncSceneActiveStatusToApi(file, cache);
-			await this.syncSceneParticipantsToApi(file, cache);
+		const frontmatter = this.getFrontmatter(cache);
+		if (!frontmatter) {
+			return;
 		}
 
+		await this.syncSceneActiveStatusToApi(file, cache);
+
+		if (!this.isSceneMarkedActive(frontmatter)) {
+			this.clearSceneSyncCaches(file.path);
+			return;
+		}
+
+		const prevFingerprint = this.sceneMetadataSyncCache.get(file.path);
+		await this.syncSceneMetadataToApi(file, cache);
+		const metadataPushed = this.sceneMetadataSyncCache.get(file.path) !== prevFingerprint
+			&& this.sceneMetadataSyncCache.has(file.path);
+
+		// Metadata push already hit the bot; skip an immediate query (reduces Discord API load).
+		if (metadataPushed) {
+			return;
+		}
+
+		const now = Date.now();
+		const cooldownUntil = this.sceneQueryCooldownUntil.get(file.path) ?? 0;
+		if (now < cooldownUntil) {
+			return;
+		}
+		this.sceneQueryCooldownUntil.set(file.path, now + SCENE_QUERY_COOLDOWN_MS);
+
 		try {
-			await this.querySceneState(file);
+			await this.querySceneState(file, { skipMetadataSync: true });
 		} catch (error) {
 			console.debug(`Error checking scene ${file.path}:`, error);
 		}
@@ -1142,6 +1282,7 @@ export default class MultimuseObsidian extends Plugin {
 			if (response.status === 200) {
 				this.sceneActiveCache.set(file.path, isActive);
 				if (!isActive) {
+					this.clearSceneSyncCaches(file.path);
 					console.log(`[MultimuseObsidian] Synced Is Active?=false for ${file.path} - removed from tracker`);
 				}
 			}
@@ -1151,46 +1292,73 @@ export default class MultimuseObsidian extends Plugin {
 	}
 
 	/**
-	 * Sync the scene's "Participants" frontmatter to the MultiMuse API.
-	 * So the bot's "your turn" / Replied? logic uses the correct participant count.
+	 * Sync Characters and/or Participants frontmatter to MultiMuse.
+	 * When obsidianSourceOfTruth is on, pushes both via scenes/create (keyed by Link thread id).
+	 * Otherwise only Participants changes are pushed (legacy behaviour).
 	 */
-	async syncSceneParticipantsToApi(file: TFile, cache: { frontmatter?: Record<string, unknown> }): Promise<void> {
+	async syncSceneMetadataToApi(file: TFile, cache: { frontmatter?: Record<string, unknown> }): Promise<void> {
 		const link = cache.frontmatter?.['Link'];
-		if (!link) return;
+		if (!link || typeof link !== 'string') return;
+
+		const frontmatter = cache.frontmatter as FrontmatterData;
+		if (!this.isSceneMarkedActive(frontmatter)) {
+			return;
+		}
 
 		const primaryUserId = await this.getPrimaryUserId();
 		if (!primaryUserId) return;
+		const characters = this.getSortedCharacterNames(frontmatter);
+		if (characters.length === 0) return;
 
-		if (typeof link !== 'string') return;
+		const participants = this.parseParticipantsFromFrontmatter(frontmatter);
+		const fingerprint = metadataFingerprint(characters, participants);
+		if (this.sceneMetadataSyncCache.get(file.path) === fingerprint) {
+			return;
+		}
 
 		const threadId = this.extractThreadIdFromUrl(link);
-		const raw = cache.frontmatter?.['Participants'];
-		const participants = typeof raw === 'number' && raw >= 1
-			? raw
-			: typeof raw === 'string'
-				? parseInt(raw, 10)
-				: 2;
-		if (isNaN(participants) || participants < 1) return;
+		if (!threadId) return;
+
+		const threadInfo = this.extractThreadInfoFromUrl(link);
 
 		try {
+			if (this.settings.obsidianSourceOfTruth) {
+				const response = await this.registerScene({
+					threadId,
+					userId: primaryUserId,
+					scenePath: file.path,
+					characters,
+					participants,
+					guildId: threadInfo?.guildId ?? null,
+					isActive: true,
+				});
+				if (response.status === 200) {
+					this.sceneMetadataSyncCache.set(file.path, fingerprint);
+					console.debug(`[MultimuseObsidian] Synced scene metadata (source of truth) for ${file.path}`);
+				}
+				return;
+			}
+
 			const body: Record<string, unknown> = {
 				scene_path: file.path,
 				user_id: primaryUserId,
-				participants: participants
+				participants,
+				thread_id: threadId,
 			};
-			if (threadId) body.thread_id = threadId;
 
 			const response = await requestUrl({
 				url: `${this.getBotApiUrl()}/api/v1/scenes/update-participants`,
 				method: 'POST',
 				headers: { ...this.getApiHeaders(), 'Content-Type': 'application/json' },
-				body: JSON.stringify(body)
+				body: JSON.stringify(body),
+				throw: false,
 			});
 			if (response.status === 200) {
+				this.sceneMetadataSyncCache.set(file.path, fingerprint);
 				console.debug(`[MultimuseObsidian] Synced Participants=${participants} for ${file.path}`);
 			}
 		} catch (e) {
-			console.debug(`[MultimuseObsidian] Could not sync Participants for ${file.path}:`, e);
+			console.debug(`[MultimuseObsidian] Could not sync scene metadata for ${file.path}:`, e);
 		}
 	}
 
@@ -1205,13 +1373,20 @@ export default class MultimuseObsidian extends Plugin {
 		return files;
 	}
 
-	/** True when the scene should be polled/synced (respects Track Is Active? setting). */
+	/** True when the scene should be polled/synced. Explicit Is Active? = false always skips API work. */
 	isSceneMarkedActive(frontmatter: FrontmatterData): boolean {
-		if (!this.settings.trackIsActive) {
-			return true;
-		}
 		const raw = frontmatter['Is Active?'];
 		return raw !== false && raw !== 'false';
+	}
+
+	private clearSceneSyncCaches(filePath: string): void {
+		this.sceneMetadataSyncCache.delete(filePath);
+		this.sceneQueryCooldownUntil.delete(filePath);
+		const debounceTimer = this.sceneChangeDebounceTimers.get(filePath);
+		if (debounceTimer !== undefined) {
+			window.clearTimeout(debounceTimer);
+			this.sceneChangeDebounceTimers.delete(filePath);
+		}
 	}
 
 	/** Scene markdown files under the scenes folder with Is Active? true (or untracked when toggle is off). */
@@ -1272,6 +1447,23 @@ export default class MultimuseObsidian extends Plugin {
 		}
 
 		return [];
+	}
+
+	getSortedCharacterNames(frontmatter: FrontmatterData): string[] {
+		return sortNamesAlphabetically(this.getCharacterNames(frontmatter));
+	}
+
+	parseParticipantsFromFrontmatter(frontmatter: FrontmatterData): number {
+		const raw = frontmatter['Participants'];
+		const participants = typeof raw === 'number' && raw >= 1
+			? raw
+			: typeof raw === 'string'
+				? parseInt(raw, 10)
+				: 2;
+		if (isNaN(participants) || participants < 1) {
+			return 2;
+		}
+		return Math.min(participants, 99);
 	}
 
 
@@ -1435,6 +1627,8 @@ export default class MultimuseObsidian extends Plugin {
 			return;
 		}
 
+		muses.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+
 		// 2) Select muse
 		const museOptions = muses.map(m => m.name);
 		const selectedMuseIndex = await this.showSuggester(museOptions, museOptions, 'Select a muse');
@@ -1548,19 +1742,23 @@ export default class MultimuseObsidian extends Plugin {
 				return;
 			}
 			
-			const registerResponse = await this.trackThread({
+			const registerResponse = await this.registerScene({
 				threadId: threadInfo.threadId,
 				userId: primaryUserId,
-				museName: selectedMuse.name,
-				participants: participants,
 				scenePath: createdFile.path,
+				characters: [selectedMuse.name],
+				participants: participants,
 				guildId: threadInfo.guildId || null,
-				characters: [selectedMuse.name]
+				isActive: true,
 			});
 			
-			console.debug(`Thread tracking response: ${registerResponse.status} - ${registerResponse.text}`);
+			console.debug(`Scene registration response: ${registerResponse.status} - ${registerResponse.text}`);
 
 			if (registerResponse.status === 200) {
+				this.sceneMetadataSyncCache.set(
+					createdFile.path,
+					metadataFingerprint([selectedMuse.name], participants)
+				);
 				// Add to Base if configured
 				try {
 					if (this.settings.basePath) {
@@ -1588,200 +1786,6 @@ export default class MultimuseObsidian extends Plugin {
 			console.error('Error details:', errorMessage);
 			
 			new Notice(`Scene created but failed to track with bot: ${errorMessage}`);
-		}
-	}
-
-	async syncFromTracker(): Promise<void> {
-		/**Sync scenes from bot tracker to Obsidian Base and create missing scene files.*/
-		if (!this.settings.apiKey) {
-			new Notice('API key must be configured in settings.');
-			return;
-		}
-
-		try {
-			// Get primary user ID for tracked threads query
-			const primaryUserId = await this.getPrimaryUserId();
-			if (!primaryUserId) {
-				new Notice('Failed to get user ID from API key. Please check your API key in settings.');
-				return;
-			}
-
-			// Get tracked threads from bot
-			const response = await requestUrl({
-				url: `${this.getBotApiUrl()}/api/v1/threads/tracked?user_id=${primaryUserId}`,
-				method: 'GET',
-				headers: this.getApiHeaders()
-			});
-
-			if (response.status !== 200) {
-				if (!this.handleApiError(response, 'syncFromTracker - fetch tracked threads')) {
-					console.error(`Failed to fetch tracked threads: ${response.status}`);
-					new Notice('Failed to fetch tracked threads from bot.');
-				}
-				return;
-			}
-
-			const data = parseJson<TrackedThreadsResponse>(response.text);
-			const threads = data.threads || [];
-
-			if (threads.length === 0) {
-				new Notice('No tracked threads found.');
-				return;
-			}
-
-			// Cross-check: which thread IDs already have a scene in Obsidian (via Link property)?
-			const existingLinksByThreadId = this.getExistingSceneLinksByThreadId();
-
-			let createdCount = 0;
-			let updatedCount = 0;
-
-			for (const thread of threads) {
-				const threadId = String(thread.thread_id ?? '');
-				const museName = thread.muse_name || 'Muse';
-				const participants = thread.participants || 2;
-				const existingScenePath = thread.scene_path;
-
-				// 1) Scene already exists at the path the tracker knows about
-				if (existingScenePath) {
-					const existingFile = this.app.vault.getAbstractFileByPath(existingScenePath);
-					if (existingFile && existingFile instanceof TFile) {
-						if (this.settings.basePath) {
-							await this.updateBaseRecord(existingFile, thread);
-						}
-						updatedCount++;
-						continue;
-					}
-				}
-
-				// 2) No scene_path from tracker, but an Obsidian note already has this thread in its Link
-				const existingFileByLink = existingLinksByThreadId.get(threadId);
-				if (existingFileByLink) {
-					if (this.settings.basePath) {
-						await this.updateBaseRecord(existingFileByLink, thread);
-					}
-					updatedCount++;
-					continue;
-				}
-
-				// 3) Create new scene only when we have a scene_path from tracker and no existing note for this thread
-				// (If no scene_path, this thread isn't linked to Obsidian from the bot's side)
-				if (!existingScenePath) {
-					continue;
-				}
-				
-				const guildId = thread.guild_id;
-				// Don't create URLs with guild_id=0 - that's invalid
-				const threadUrl = guildId && guildId !== '0' && guildId !== 0
-					? `https://discord.com/channels/${guildId}/${threadId}`
-					: null;  // Can't create valid URL without guild_id
-				
-				if (!threadUrl) {
-					console.debug(`Skipping thread ${threadId} - no valid guild_id`);
-					continue;
-				}
-
-				// Determine location (use scenes folder + default subfolder or prompt)
-				const location = await this.selectSceneLocation(`muse "${museName}"`);
-				if (!location) continue;
-
-				const sceneName = thread.thread_name || `${museName} - Thread ${threadId}`;
-				const filePath = `${location}/${sceneName}.md`;
-
-				const frontmatter: Record<string, FrontmatterValue> = {
-					'Link': threadUrl,
-					'Characters': [museName],
-					'Participants': participants,
-					'Replied?': false,
-					'Created': new Date().toISOString().split('T')[0],
-				};
-
-				// Add Roleplay property if enabled
-				if (this.settings.trackRoleplay) {
-					const roleplay = this.extractRoleplayFromPath(location);
-					if (roleplay) {
-						frontmatter['Roleplay'] = roleplay;
-					}
-				}
-
-				// Add Is Active? property if enabled
-				if (this.settings.trackIsActive) {
-					frontmatter['Is Active?'] = true;
-				}
-
-				const frontmatterLines = ['---'];
-				for (const [key, value] of Object.entries(frontmatter)) {
-					if (Array.isArray(value)) {
-						frontmatterLines.push(`${key}:`);
-						for (const item of value) {
-							frontmatterLines.push(`  - ${item}`);
-						}
-					} else {
-						frontmatterLines.push(`${key}: ${value}`);
-					}
-				}
-				frontmatterLines.push('---');
-				frontmatterLines.push('');
-
-				const content = frontmatterLines.join('\n');
-
-				// Ensure all folders in the path exist (create recursively)
-				const segs = location.split("/").filter(Boolean);
-				let currentPath = segs[0];
-				
-				// Ensure root folder exists
-				let abs = this.app.vault.getAbstractFileByPath(currentPath);
-				if (!abs) {
-					await this.app.vault.createFolder(currentPath);
-				}
-				
-				// Create nested folders
-				for (let i = 1; i < segs.length; i++) {
-					currentPath += "/" + segs[i];
-					const folder = this.app.vault.getAbstractFileByPath(currentPath);
-					if (!folder) {
-						await this.app.vault.createFolder(currentPath);
-					}
-				}
-
-				// Create file
-				const file = await this.app.vault.create(filePath, content);
-				
-				// Mark this file as recently created to skip immediate checking
-				this.recentlyCreatedFiles.add(filePath);
-				// Remove from the set after 30 seconds (enough time for the scene to be registered with the API)
-				window.setTimeout(() => {
-					this.recentlyCreatedFiles.delete(filePath);
-				}, 30000);
-
-				// Link the created note back to the current Discord-side thread tracker.
-				const primaryUserId = await this.getPrimaryUserId();
-				if (!primaryUserId) {
-					console.error('Failed to get user ID from API key, skipping thread tracking update');
-					continue;
-				}
-				
-				await this.trackThread({
-					threadId: threadId,
-					userId: primaryUserId,
-					museName: museName,
-					participants: Number(participants) || 2,
-					scenePath: filePath,
-					guildId: guildId ? String(guildId) : null,
-					characters: [museName]
-				});
-
-				// Add to Base if configured
-				if (this.settings.basePath) {
-					await this.addSceneToBase(file, frontmatter);
-				}
-
-				createdCount++;
-			}
-
-			new Notice(`Sync complete: ${createdCount} created, ${updatedCount} updated`);
-		} catch (error) {
-			console.error('Error syncing from tracker:', error);
-			new Notice('Error syncing from tracker. Check console for details.');
 		}
 	}
 
@@ -1998,46 +2002,6 @@ export default class MultimuseObsidian extends Plugin {
 			}
 		} catch (error) {
 			console.error('Error adding scene to Base:', error);
-		}
-	}
-
-	async updateBaseRecord(file: TFile, thread: TrackedThread): Promise<void> {
-		/**Update existing Base record for a scene.*/
-		if (!this.settings.basePath) return;
-
-		try {
-			const baseFile = this.app.vault.getAbstractFileByPath(this.settings.basePath);
-			if (!baseFile || !(baseFile instanceof TFile)) return;
-
-			// Skip .base files - they use a special format
-			if (baseFile.extension === 'base') {
-				return;
-			}
-
-			// Only handle .md files
-			if (baseFile.extension !== 'md') {
-				return;
-			}
-
-			const baseContent = await this.app.vault.read(baseFile);
-			const sceneName = file.basename;
-
-			// Update the row for this scene
-			const lines = baseContent.split('\n');
-			const updatedLines = lines.map(line => {
-				if (line.includes(`| ${sceneName} |`)) {
-					const characters = [thread.muse_name || 'Muse'];
-					const link = thread.guild_id && thread.guild_id !== '0'
-						? `https://discord.com/channels/${thread.guild_id}/${thread.thread_id}`
-						: `https://discord.com/channels/0/${thread.thread_id}`;
-					return `| ${sceneName} | ${characters.join(', ')} | ${link} | ${thread.participants || 2} | false |`;
-				}
-				return line;
-			});
-
-			await this.app.vault.modify(baseFile, updatedLines.join('\n'));
-		} catch (error) {
-			console.error('Error updating Base record:', error);
 		}
 	}
 
@@ -2344,13 +2308,18 @@ export default class MultimuseObsidian extends Plugin {
 			new Notice('No members returned for this server. Bot may need Server Members intent.');
 			return;
 		}
-		const labels = members.map(m => {
+		const sortedMembers = [...members].sort((a, b) => {
+			const aName = a.display_name || a.username;
+			const bName = b.display_name || b.username;
+			return aName.localeCompare(bName, undefined, { sensitivity: 'base' });
+		});
+		const labels = sortedMembers.map(m => {
 			const d = m.display_name || m.username;
 			return m.username !== d ? `${d} (@${m.username})` : d;
 		});
-		const idx = await this.showSuggester(labels, members, 'Insert @ mention – choose user');
+		const idx = await this.showSuggester(labels, sortedMembers, 'Insert @ mention – choose user');
 		if (idx === null || idx < 0) return;
-		const chosen = members[idx];
+		const chosen = sortedMembers[idx];
 		const mention = `<@${chosen.id}>`;
 		const editor = view.editor;
 		const sel = editor.getSelection();
@@ -2393,7 +2362,7 @@ export default class MultimuseObsidian extends Plugin {
 			return;
 		}
 
-		const characters = this.getCharacterNames(frontmatter);
+		const characters = this.getSortedCharacterNames(frontmatter);
 		if (characters.length === 0) {
 			new Notice('No Characters property found in frontmatter. Please add at least one character name.');
 			return;
@@ -2433,7 +2402,7 @@ export default class MultimuseObsidian extends Plugin {
 			user_id: primaryUserId,
 		};
 
-		void this.deliverPostAsMuse(selectedMuse, primaryUserId, threadId, postBody);
+		void this.deliverPostAsMuse(selectedMuse, primaryUserId, threadId, postBody, file);
 	}
 
 	private async applyMuseWrappersToPost(
@@ -2460,7 +2429,8 @@ export default class MultimuseObsidian extends Plugin {
 		selectedMuse: string,
 		primaryUserId: string,
 		threadId: string,
-		postBody: Record<string, unknown>
+		postBody: Record<string, unknown>,
+		sceneFile?: TFile
 	): Promise<void> {
 		try {
 			await this.yieldPollSlot();
@@ -2511,6 +2481,9 @@ export default class MultimuseObsidian extends Plugin {
 
 			if (response.status === 200 || response.status === 202) {
 				new Notice(`Message sent as ${selectedMuse}!`);
+				if (sceneFile) {
+					await this.updateFrontmatter(sceneFile, 'Replied?', true);
+				}
 				void this.syncMuses();
 			} else if (!this.handleApiError(response, 'sendSelectionAsMuse - post message')) {
 				const errorData = parseJson<ApiErrorBody>(response.text);
@@ -2631,6 +2604,17 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				}));
 
+		new Setting(containerEl)
+			.setName('Obsidian as source of truth')
+			.setDesc('When enabled, edits to Characters and Participants in scene frontmatter are pushed to MultiMuse using the thread id from Link. Use this when you adjust muses or participant counts in Obsidian instead of Discord.')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.obsidianSourceOfTruth)
+				.onChange(async (value) => {
+					this.plugin.settings.obsidianSourceOfTruth = value;
+					this.plugin.sceneMetadataSyncCache.clear();
+					await this.plugin.saveSettings();
+				}));
+
 		// Bot API URL - Hidden from user for security (uses hardcoded default)
 		// Removed from settings UI to prevent exposing server IP address
 
@@ -2696,7 +2680,7 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 				.setButtonText('Check Now')
 				.setCta()
 				.onClick(() => {
-					void this.plugin.checkAllThreads();
+					void this.plugin.checkAllThreads({ force: true });
 					new Notice('Checking Discord threads...');
 				}));
 
@@ -2706,10 +2690,10 @@ class MultimuseObsidianSettingTab extends PluginSettingTab {
 		new Setting(infoEl)
 			.setName('How It Works')
 			.setHeading();
-		infoEl.createEl('p', { text: 'This plugin queries the Multimuse API to check if your scene files match tracked threads and updates the "Replied?" and "Participants" fields.' });
-		infoEl.createEl('p', { text: '• Scenes are matched by Link (thread_id) and Characters properties' });
-		infoEl.createEl('p', { text: '• If scene matches a tracked thread: Updates Replied? only (true = you replied, false = need to reply). Participants is always editable in frontmatter.' });
-		infoEl.createEl('p', { text: '• If scene does not match: No updates (scene is not tracked)' });
+		infoEl.createEl('p', { text: 'This plugin queries the Multimuse API to check if your scene files match tracked threads and updates the "Replied?" field.' });
+		infoEl.createEl('p', { text: '• Scenes are matched by Link (thread id) and Characters properties' });
+		infoEl.createEl('p', { text: '• Use **Check Discord Threads Now** (or polling) to refresh Replied? — true = you replied, false = your turn' });
+		infoEl.createEl('p', { text: '• Enable **Obsidian as source of truth** to push Characters and Participants changes from frontmatter to the tracker' });
 		infoEl.createEl('p', { text: '• Make sure your scene files have a "Link" field (Discord thread URL) and "Characters" field (array) in frontmatter' });
 		infoEl.createEl('p', { text: '• Uses Multimuse API - requires an API key for authentication' });
 		infoEl.createEl('p', { text: '• Generate an API key using /api generate in Discord DMs with the bot' });
