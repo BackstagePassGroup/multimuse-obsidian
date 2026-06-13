@@ -408,7 +408,7 @@ export default class MultimuseObsidian extends Plugin {
 	/** Brief yield for the current poll loop to exit; never block posts on a full poll batch. */
 	private async yieldPollSlot(maxWaitMs = POLL_YIELD_MS): Promise<void> {
 		this.prioritizePostOverPolling();
-		if (!this.pollRunPromise) {
+		if (this.pollRunPromise === null) {
 			return;
 		}
 		await Promise.race([
@@ -695,8 +695,8 @@ export default class MultimuseObsidian extends Plugin {
 			}
 			const data = parseJson<MuseWrappersResolveResponse>(response.text);
 			return {
-				header: (data.header || '').trim() ? data.header! : '',
-				footer: (data.footer || '').trim() ? data.footer! : '',
+				header: (data.header ?? '').trim(),
+				footer: (data.footer ?? '').trim(),
 			};
 		} catch (error) {
 			console.debug('[MultimuseObsidian] resolveMuseWrappers:', error);
@@ -2129,20 +2129,21 @@ export default class MultimuseObsidian extends Plugin {
 
 	showSuggester<T>(items: string[], _values: T[], title?: string): Promise<number | null> {
 		return new Promise((resolve) => {
-			const plugin = this;
 			const modal = new (class extends Modal {
 				selectedIndex: number | null = null;
 				items: string[];
 				titleText: string;
+				host: MultimuseObsidian;
 
-				constructor(app: App, items: string[], titleText?: string) {
+				constructor(app: App, items: string[], titleText: string | undefined, host: MultimuseObsidian) {
 					super(app);
 					this.items = items;
 					this.titleText = titleText || 'Select an option';
+					this.host = host;
 				}
 
 				onOpen() {
-					plugin.isolateWizardModal(this);
+					this.host.isolateWizardModal(this);
 					const { contentEl } = this;
 					contentEl.empty();
 					this.setTitle(this.titleText);
@@ -2190,7 +2191,7 @@ export default class MultimuseObsidian extends Plugin {
 				onClose() {
 					resolve(this.selectedIndex);
 				}
-			})(this.app, items, title);
+			})(this.app, items, title, this);
 
 			modal.open();
 		});
@@ -2198,14 +2199,19 @@ export default class MultimuseObsidian extends Plugin {
 
 	showInputPrompt(prompt: string, defaultValue?: string): Promise<string | null> {
 		return new Promise((resolve) => {
-			const plugin = this;
 			const modal = new (class extends Modal {
 				inputEl!: HTMLInputElement;
 				value: string | null = null;
 				cancelled = false;
+				host: MultimuseObsidian;
+				promptText: string;
+				defaultText: string;
 
-				constructor(app: App) {
+				constructor(app: App, host: MultimuseObsidian, promptText: string, defaultText?: string) {
 					super(app);
+					this.host = host;
+					this.promptText = promptText;
+					this.defaultText = defaultText || '';
 				}
 
 				confirm(): void {
@@ -2215,8 +2221,8 @@ export default class MultimuseObsidian extends Plugin {
 				}
 
 				onOpen() {
-					plugin.isolateWizardModal(this, () => this.confirm());
-					this.setTitle(prompt);
+					this.host.isolateWizardModal(this, () => this.confirm());
+					this.setTitle(this.promptText);
 					const { contentEl } = this;
 					contentEl.empty();
 
@@ -2224,7 +2230,7 @@ export default class MultimuseObsidian extends Plugin {
 						type: 'text',
 						cls: 'multimuse-input',
 					});
-					this.inputEl.value = defaultValue || '';
+					this.inputEl.value = this.defaultText;
 
 					new Setting(contentEl)
 						.addButton((btn) => btn
@@ -2247,7 +2253,7 @@ export default class MultimuseObsidian extends Plugin {
 				onClose() {
 					resolve(this.cancelled ? null : this.value);
 				}
-			})(this.app);
+			})(this.app, this, prompt, defaultValue);
 
 			modal.open();
 		});
